@@ -1,0 +1,3051 @@
+From fc11c5cc1cde7f5b519d7e4846979d3e7662c22b Mon Sep 17 00:00:00 2001
+From: Lyrico WebDAV <lyrico@local>
+Date: Sat, 14 Nov 2026 09:19:05 +0800
+Subject: [PATCH 1/3] =?UTF-8?q?feat:=20=E6=94=AF=E6=8C=81=E5=B0=86=20WebDA?=
+ =?UTF-8?q?V=20=E7=9B=AE=E5=BD=95=E4=BD=9C=E4=B8=BA=E9=9F=B3=E4=B9=90?=
+ =?UTF-8?q?=E5=BA=93=E6=A0=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新增 WebDAV 客户端（PROPFIND/GET/PUT/DELETE/MOVE/MKCOL），自定义 URI scheme
+  lyricowebdav:// 与 lyricowebdav-tree:// 标识远程文件
+- 文件夹管理页新增「添加 WebDAV 目录」向导：填连接、测试、浏览目录、注册
+- 扫描链路支持 SAF 与 WebDAV 双来源合并，远程文件整体下载后读标签
+- 标签写入采用下载→修改→整体 PUT 回写；上传失败不再被误报成功
+- 新增扫描工作日志（数据库 23→24）：每处理一个文件落库，
+  中断、断网、被杀后可从上次进度续扫，已完成文件不再重复下载
+- 目录缺失判定只认 HTTP 404，网络错误不会误清空远程曲库
+- 远程文件支持删除与 MOVE 重命名
+---
+ .../com/lonx/lyrico/data/LyricoDatabase.kt    |  53 +-
+ .../lyrico/data/model/dao/ScanJournalDao.kt   | 136 +++++
+ .../data/model/entity/ScanJournalEntity.kt    |  96 ++++
+ .../repository/LibraryFolderRepository.kt     |  22 +-
+ .../lyrico/data/song/file/AudioFileAccess.kt  |  48 +-
+ .../data/song/file/SongFileRepositoryImpl.kt  |  46 +-
+ .../lyrico/data/song/file/WebDavFileBridge.kt | 151 ++++++
+ .../song/scan/LibraryScanRepositoryImpl.kt    | 151 +++++-
+ .../data/song/scan/ScanJournalRecorder.kt     | 150 ++++++
+ .../data/song/tag/AudioTagRepositoryImpl.kt   |  44 +-
+ .../lonx/lyrico/data/webdav/WebDavClient.kt   | 497 ++++++++++++++++++
+ .../lonx/lyrico/data/webdav/WebDavConfig.kt   | 103 ++++
+ .../data/webdav/WebDavFileOperations.kt       |  52 ++
+ .../lonx/lyrico/data/webdav/WebDavScanner.kt  | 165 ++++++
+ .../com/lonx/lyrico/data/webdav/WebDavUri.kt  |  75 +++
+ .../main/java/com/lonx/lyrico/di/AppModule.kt |  20 +-
+ .../lyrico/screens/FolderManagerScreen.kt     |  34 ++
+ .../lonx/lyrico/screens/WebDavSetupDialog.kt  | 152 ++++++
+ .../lonx/lyrico/utils/LibraryScanManager.kt   |  23 +
+ .../viewmodel/FolderManagerViewModel.kt       |  38 ++
+ .../lyrico/viewmodel/WebDavSetupViewModel.kt  | 170 ++++++
+ .../src/main/res/values-zh-rCN/strings.xml    |   1 +
+ .../src/main/res/values-zh-rHK/strings.xml    |   1 +
+ .../src/main/res/values-zh-rTW/strings.xml    |   1 +
+ lyrico-app/src/main/res/values/strings.xml    |   1 +
+ 25 files changed, 2192 insertions(+), 38 deletions(-)
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/model/dao/ScanJournalDao.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/model/entity/ScanJournalEntity.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/WebDavFileBridge.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/ScanJournalRecorder.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavConfig.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavFileOperations.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavUri.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/screens/WebDavSetupDialog.kt
+ create mode 100644 lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
+
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/LyricoDatabase.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/LyricoDatabase.kt
+index 2a7e8f1..96d8e2d 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/LyricoDatabase.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/LyricoDatabase.kt
+@@ -39,9 +39,11 @@ import com.lonx.lyrico.data.model.entity.DEFAULT_PLUGIN_CAPABILITIES_SQL
+         SourcePluginEntity::class,
+         SongCustomTagKeyEntity::class,
+         com.lonx.lyrico.data.model.entity.PluginSubscriptionEntity::class,
+-        com.lonx.lyrico.data.model.entity.PluginCatalogCacheEntity::class
++        com.lonx.lyrico.data.model.entity.PluginCatalogCacheEntity::class,
++        com.lonx.lyrico.data.model.entity.ScanJournalEntity::class,
++        com.lonx.lyrico.data.model.entity.ScanJournalItemEntity::class
+     ],
+-    version = 23,
++    version = 24,
+     exportSchema = true,
+     autoMigrations = [
+         AutoMigration(from = 2, to = 3),
+@@ -66,8 +68,55 @@ abstract class LyricoDatabase : RoomDatabase() {
+     abstract fun sourcePluginDao(): SourcePluginDao
+     abstract fun songCustomTagKeyDao(): SongCustomTagKeyDao
+     abstract fun pluginSubscriptionDao(): com.lonx.lyrico.data.model.dao.PluginSubscriptionDao
++    abstract fun scanJournalDao(): com.lonx.lyrico.data.model.dao.ScanJournalDao
+ 
+     companion object {
++        /**
++         * 23 → 24：新增扫描工作日志表。
++         * 远程库扫描可能持续很久，必须能跨进程重启续作，否则每次中断都从头再来。
++         */
++        val MIGRATION_23_24 = object : Migration(23, 24) {
++            override fun migrate(db: SupportSQLiteDatabase) {
++                db.execSQL(
++                    "CREATE TABLE IF NOT EXISTS scan_journals (" +
++                        "journalId TEXT NOT NULL PRIMARY KEY, " +
++                        "scopeFolderIds TEXT, " +
++                        "status TEXT NOT NULL, " +
++                        "fullRescan INTEGER NOT NULL, " +
++                        "totalFiles INTEGER NOT NULL, " +
++                        "processedFiles INTEGER NOT NULL, " +
++                        "insertedCount INTEGER NOT NULL, " +
++                        "updatedCount INTEGER NOT NULL, " +
++                        "failedCount INTEGER NOT NULL, " +
++                        "skippedCount INTEGER NOT NULL, " +
++                        "currentStage TEXT, " +
++                        "currentFile TEXT, " +
++                        "lastError TEXT, " +
++                        "createdAt INTEGER NOT NULL, " +
++                        "updatedAt INTEGER NOT NULL, " +
++                        "finishedAt INTEGER)"
++                )
++                db.execSQL("CREATE INDEX IF NOT EXISTS index_scan_journals_status ON scan_journals(status)")
++                db.execSQL("CREATE INDEX IF NOT EXISTS index_scan_journals_createdAt ON scan_journals(createdAt)")
++                db.execSQL(
++                    "CREATE TABLE IF NOT EXISTS scan_journal_items (" +
++                        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
++                        "journalId TEXT NOT NULL, " +
++                        "uri TEXT NOT NULL, " +
++                        "fileName TEXT NOT NULL, " +
++                        "folderId INTEGER NOT NULL, " +
++                        "status TEXT NOT NULL, " +
++                        "message TEXT, " +
++                        "updatedAt INTEGER NOT NULL)"
++                )
++                db.execSQL(
++                    "CREATE UNIQUE INDEX IF NOT EXISTS index_scan_journal_items_journalId_uri " +
++                        "ON scan_journal_items(journalId, uri)"
++                )
++                db.execSQL("CREATE INDEX IF NOT EXISTS index_scan_journal_items_status ON scan_journal_items(status)")
++            }
++        }
++
+         val MIGRATION_22_23 = object : Migration(22, 23) {
+             override fun migrate(db: SupportSQLiteDatabase) {
+                 db.execSQL("CREATE TABLE IF NOT EXISTS plugin_subscriptions (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, enabled INTEGER NOT NULL, sortOrder INTEGER NOT NULL)")
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/model/dao/ScanJournalDao.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/model/dao/ScanJournalDao.kt
+new file mode 100644
+index 0000000..1239a68
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/model/dao/ScanJournalDao.kt
+@@ -0,0 +1,136 @@
++package com.lonx.lyrico.data.model.dao
++
++import androidx.room.Dao
++import androidx.room.Insert
++import androidx.room.OnConflictStrategy
++import androidx.room.Query
++import androidx.room.Transaction
++import com.lonx.lyrico.data.model.entity.ScanJournalEntity
++import com.lonx.lyrico.data.model.entity.ScanJournalItemEntity
++import com.lonx.lyrico.data.model.entity.ScanJournalItemStatus
++import com.lonx.lyrico.data.model.entity.ScanJournalStatus
++import kotlinx.coroutines.flow.Flow
++
++@Dao
++interface ScanJournalDao {
++
++    @Insert(onConflict = OnConflictStrategy.REPLACE)
++    suspend fun upsertJournal(journal: ScanJournalEntity)
++
++    @Query("SELECT * FROM scan_journals WHERE journalId = :journalId")
++    suspend fun getJournal(journalId: String): ScanJournalEntity?
++
++    @Query("""
++        SELECT * FROM scan_journals
++        WHERE status IN ('RUNNING', 'PAUSED')
++        ORDER BY updatedAt DESC
++        LIMIT 1
++    """)
++    suspend fun getResumableJournal(): ScanJournalEntity?
++
++    @Query("SELECT * FROM scan_journals ORDER BY createdAt DESC LIMIT 20")
++    fun observeRecentJournals(): Flow<List<ScanJournalEntity>>
++
++    @Query("""
++        UPDATE scan_journals SET
++            totalFiles = :totalFiles,
++            processedFiles = :processed,
++            insertedCount = :inserted,
++            updatedCount = :updated,
++            failedCount = :failed,
++            skippedCount = :skipped,
++            currentStage = :stage,
++            currentFile = :currentFile,
++            updatedAt = :now
++        WHERE journalId = :journalId
++    """)
++    suspend fun updateProgress(
++        journalId: String,
++        totalFiles: Int,
++        processed: Int,
++        inserted: Int,
++        updated: Int,
++        failed: Int,
++        skipped: Int,
++        stage: String?,
++        currentFile: String?,
++        now: Long = System.currentTimeMillis(),
++    )
++
++    @Query("""
++        UPDATE scan_journals
++        SET status = :status, lastError = :error, finishedAt = :finishedAt, updatedAt = :now
++        WHERE journalId = :journalId
++    """)
++    suspend fun updateStatus(
++        journalId: String,
++        status: String,
++        error: String? = null,
++        finishedAt: Long? = null,
++        now: Long = System.currentTimeMillis(),
++    )
++
++    @Insert(onConflict = OnConflictStrategy.REPLACE)
++    suspend fun upsertItem(item: ScanJournalItemEntity)
++
++    @Transaction
++    suspend fun recordItem(item: ScanJournalItemEntity) {
++        upsertItem(item)
++    }
++
++    @Query("SELECT uri FROM scan_journal_items WHERE journalId = :journalId AND status = 'done'")
++    suspend fun getCompletedUris(journalId: String): List<String>
++
++    @Query("SELECT COUNT(*) FROM scan_journal_items WHERE journalId = :journalId AND status = 'done'")
++    suspend fun countCompleted(journalId: String): Int
++
++    @Query("DELETE FROM scan_journal_items WHERE journalId = :journalId")
++    suspend fun clearItems(journalId: String)
++
++    @Query("DELETE FROM scan_journals WHERE journalId = :journalId")
++    suspend fun deleteJournal(journalId: String)
++
++    @Transaction
++    suspend fun deleteJournalWithItems(journalId: String) {
++        clearItems(journalId)
++        deleteJournal(journalId)
++    }
++
++    /** 清理过旧的工作日志，避免无限增长。 */
++    @Transaction
++    suspend fun pruneOldJournals(keepCount: Int = 5) {
++        val old = getOldFinishedJournalIds(keepCount)
++        old.forEach { deleteJournalWithItems(it) }
++    }
++
++    @Query("""
++        SELECT journalId FROM scan_journals
++        WHERE status IN ('FINISHED', 'FAILED')
++        ORDER BY createdAt DESC
++        LIMIT -1 OFFSET :keepCount
++    """)
++    suspend fun getOldFinishedJournalIds(keepCount: Int): List<String>
++
++    /**
++     * 标记为完成时保留已处理条目，方便用户查看本次扫描跳过了哪些文件；
++     * 只有超过保留数量的旧日志才会连条目一起删除。
++     */
++    @Query("""
++        SELECT COUNT(*) FROM scan_journal_items
++        WHERE journalId = :journalId AND status IN ('failed', 'skipped')
++    """)
++    suspend fun countProblemItems(journalId: String): Int
++
++    @Query("UPDATE scan_journal_items SET status = :status WHERE journalId = :journalId AND status = 'failed'")
++    suspend fun resetFailedItems(journalId: String, status: String = ScanJournalItemStatus.DONE)
++
++    @Query("SELECT * FROM scan_journal_items WHERE journalId = :journalId AND status != 'done'")
++    suspend fun getProblemItems(journalId: String): List<ScanJournalItemEntity>
++
++    @Query("UPDATE scan_journals SET status = 'PAUSED', updatedAt = :now WHERE status = 'RUNNING'")
++    suspend fun markAllRunningAsPaused(now: Long = System.currentTimeMillis())
++}
++
++/** 供 UI 判断是否还有可续作的扫描。 */
++suspend fun ScanJournalDao.resumableOrNull(): ScanJournalEntity? =
++    getResumableJournal()?.takeIf { it.status == ScanJournalStatus.RUNNING || it.status == ScanJournalStatus.PAUSED }
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/model/entity/ScanJournalEntity.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/model/entity/ScanJournalEntity.kt
+new file mode 100644
+index 0000000..61751ca
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/model/entity/ScanJournalEntity.kt
+@@ -0,0 +1,96 @@
++package com.lonx.lyrico.data.model.entity
++
++import androidx.room.Entity
++import androidx.room.Index
++import androidx.room.PrimaryKey
++
++/**
++ * 一次库扫描的持久化工作日志。
++ *
++ * 远程（WebDAV）库可能包含上千首文件，单次扫描耗时可达数十分钟。
++ * 用户中途退出、切网、熄屏被杀都很常见，没有工作日志就只能从头再来，
++ * 已经下载并解析过的标签全部作废。这张表记录扫描进度与每个文件的处理结果，
++ * 再次启动时据此跳过已完成的部分。
++ */
++@Entity(
++    tableName = "scan_journals",
++    indices = [Index("status"), Index("createdAt")]
++)
++data class ScanJournalEntity(
++    @PrimaryKey val journalId: String,
++
++    /** 扫描范围：null 表示全库，否则是逗号分隔的根文件夹 id。 */
++    val scopeFolderIds: String?,
++
++    /** RUNNING / PAUSED / FINISHED / FAILED */
++    val status: String,
++
++    val fullRescan: Boolean,
++
++    /** 枚举阶段发现的总文件数，-1 表示尚未枚举完成。 */
++    val totalFiles: Int = -1,
++
++    /** 已处理文件数（含跳过与失败）。 */
++    val processedFiles: Int = 0,
++
++    val insertedCount: Int = 0,
++
++    val updatedCount: Int = 0,
++
++    val failedCount: Int = 0,
++
++    val skippedCount: Int = 0,
++
++    val currentStage: String? = null,
++
++    val currentFile: String? = null,
++
++    val lastError: String? = null,
++
++    val createdAt: Long = System.currentTimeMillis(),
++
++    val updatedAt: Long = System.currentTimeMillis(),
++
++    val finishedAt: Long? = null,
++)
++
++/**
++ * 扫描工作日志中的单个文件处理结果。
++ * 状态 done 的条目会在续扫时直接跳过，不再下载也不再读标签。
++ */
++@Entity(
++    tableName = "scan_journal_items",
++    indices = [Index("journalId", "uri", unique = true), Index("status")]
++)
++data class ScanJournalItemEntity(
++    @PrimaryKey(autoGenerate = true)
++    val id: Long = 0,
++
++    val journalId: String,
++
++    val uri: String,
++
++    val fileName: String,
++
++    val folderId: Long,
++
++    /** done / failed / skipped */
++    val status: String,
++
++    val message: String? = null,
++
++    val updatedAt: Long = System.currentTimeMillis(),
++)
++
++object ScanJournalStatus {
++    const val RUNNING = "RUNNING"
++    const val PAUSED = "PAUSED"
++    const val FINISHED = "FINISHED"
++    const val FAILED = "FAILED"
++}
++
++object ScanJournalItemStatus {
++    const val DONE = "done"
++    const val FAILED = "failed"
++    const val SKIPPED = "skipped"
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
+index a95b224..55f3e07 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
+@@ -8,6 +8,7 @@ import com.lonx.lyrico.data.model.entity.FolderEntity
+ import com.lonx.lyrico.data.model.log.AppLog
+ import com.lonx.lyrico.data.model.log.AppLogLevel
+ import com.lonx.lyrico.data.model.log.AppLogType
++import com.lonx.lyrico.data.webdav.WebDavUri
+ import com.lonx.lyrico.utils.UriUtils
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.CancellationException
+@@ -41,6 +42,21 @@ class LibraryFolderRepository(
+         }
+     }
+ 
++    /**
++     * 注册一个 WebDAV 根目录。treeUri 使用 lyricowebdav-tree://<connectionId>?path=/Music，
++     * 与 SAF 的 treeUri 共用同一列，扫描时按 scheme 分派。
++     */
++    suspend fun registerWebDav(path: String, rootUri: String): Long = operationLock.withLock {
++        withContext(Dispatchers.IO) {
++            database.withTransaction {
++                val registeredId = folders.upsertAndGetId(path, rootUri, addedBySaf = true)
++                folders.setIgnored(registeredId, false)
++                indexes.refreshAndPruneIndexes()
++                registeredId
++            }
++        }
++    }
++
+     suspend fun remove(folderId: Long) = operationLock.withLock {
+         withContext(Dispatchers.IO) {
+             val removed = database.withTransaction {
+@@ -83,7 +99,11 @@ class LibraryFolderRepository(
+         try {
+             val retained = folders.getAllFoldersOnce().mapNotNull { it.treeUri }.toSet() +
+                 listOfNotNull(settings.artistPosterFolder.first())
+-            candidates.distinct().filterNot { it in retained }.forEach { uri ->
++            // WebDAV 根目录不是 Android 的持久化授权，没有需要释放的权限
++            candidates.distinct()
++                .filterNot { it in retained }
++                .filterNot { WebDavUri.isWebDavUri(it) || WebDavUri.parseRootUri(it) != null }
++                .forEach { uri ->
+                 if (!UriUtils.releasePersistedPermission(context.contentResolver, uri)) {
+                     AppLog.record(AppLogType.APP, "LibraryFolders", "Library grant release incomplete",
+                         "treeUri=$uri", uri, AppLogLevel.WARNING)
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/AudioFileAccess.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/AudioFileAccess.kt
+index e4ed8a1..4f71dc8 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/AudioFileAccess.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/AudioFileAccess.kt
+@@ -12,13 +12,30 @@ import android.provider.MediaStore
+ import android.provider.OpenableColumns
+ import android.util.Log
+ import androidx.core.net.toUri
++import com.lonx.lyrico.data.webdav.WebDavUri
+ import java.io.File
+ import java.io.FileNotFoundException
+ 
+ class AudioFileAccess(
+-    private val context: Context
++    private val context: Context,
++    private val webDavBridge: WebDavFileBridge,
+ ) {
++    /** 是否为远程 WebDAV 文件（标签读写需要走下载 → 修改 → 上传）。 */
++    fun isWebDavUri(uriString: String): Boolean = WebDavUri.isWebDavUri(uriString)
++
++    /** WebDAV 临时文件出现改动时，把整份文件 PUT 回服务器。 */
++    suspend fun commitWebDavDescriptor(descriptor: ParcelFileDescriptor): Boolean =
++        webDavBridge.commitHandle(descriptor)
++
++    /** 上传完成后再释放缓存文件（调用方关闭描述符之后调用）。 */
++    fun releaseWebDavDescriptor(descriptor: ParcelFileDescriptor) = webDavBridge.release(descriptor)
++
+     fun getDisplayName(uriString: String): String {
++        if (WebDavUri.isWebDavUri(uriString)) {
++            return WebDavUri.parseFileUri(uriString)?.relativePath?.substringAfterLast('/')
++                ?.takeIf { it.isNotBlank() }
++                ?: uriString.substringAfterLast("/")
++        }
+         val uri = uriString.toUri()
+         return when (uri.scheme) {
+             "content" -> getOpenableDisplayName(uri)
+@@ -28,6 +45,10 @@ class AudioFileAccess(
+     }
+ 
+     fun openReadableDescriptor(uriString: String, trace: (String) -> Unit = {}): ParcelFileDescriptor? {
++        if (WebDavUri.isWebDavUri(uriString)) {
++            trace("webdav-download uri=$uriString")
++            return webDavBridge.openReadable(uriString, context.cacheDir)
++        }
+         val uri = uriString.toUri()
+         if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
+             val file = if (uri.scheme == "file") {
+@@ -42,6 +63,10 @@ class AudioFileAccess(
+     }
+ 
+     fun openWritableDescriptor(uriString: String, trace: (String) -> Unit = {}): ParcelFileDescriptor? {
++        if (WebDavUri.isWebDavUri(uriString)) {
++            trace("webdav-download-for-write uri=$uriString")
++            return webDavBridge.openWritable(uriString, context.cacheDir)
++        }
+         val uri = uriString.toUri()
+         if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
+             val file = if (uri.scheme == "file") {
+@@ -106,9 +131,30 @@ class AudioFileAccess(
+     }
+ 
+     fun openInputBytes(uri: Uri): ByteArray? {
++        if (WebDavUri.isWebDavUri(uri.toString())) {
++            return webDavBridge.openReadable(uri.toString(), context.cacheDir).use { descriptor ->
++                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
++            }
++        }
+         return context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+     }
+ 
++    fun openInputStream(uri: Uri): java.io.InputStream? {
++        if (WebDavUri.isWebDavUri(uri.toString())) {
++            val descriptor = webDavBridge.openReadable(uri.toString(), context.cacheDir)
++            return ParcelFileDescriptor.AutoCloseInputStream(descriptor)
++        }
++        return context.contentResolver.openInputStream(uri)
++    }
++
++    /**
++     * 上传替换后，本地缓存里的旧副本已经失效，释放描述符时一并清理。
++     */
++    fun closeAndRelease(descriptor: ParcelFileDescriptor) {
++        webDavBridge.release(descriptor)
++    }
++
++
+     private fun openContentDescriptor(uri: Uri, mode: String, trace: (String) -> Unit = {}): ParcelFileDescriptor? {
+         var originalFailure: Exception? = null
+         var mappedFailure: Exception? = null
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/SongFileRepositoryImpl.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/SongFileRepositoryImpl.kt
+index 8571723..a9d29fd 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/SongFileRepositoryImpl.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/SongFileRepositoryImpl.kt
+@@ -11,6 +11,7 @@ import com.lonx.lyrico.data.model.log.AppLogLevel
+ import com.lonx.lyrico.data.model.log.recordOperation
+ import com.lonx.lyrico.data.model.log.newLogOperation
+ import com.lonx.lyrico.data.repository.AppLogRepository
++import com.lonx.lyrico.data.webdav.WebDavFileOperations
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.withContext
+@@ -20,12 +21,15 @@ import java.io.FileNotFoundException
+ class SongFileRepositoryImpl(
+     private val context: Context,
+     private val fileAccess: AudioFileAccess,
++    private val webDavOperations: WebDavFileOperations,
+     private val appLogRepository: AppLogRepository,
+     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+ ) : SongFileRepository {
+ 
+     override suspend fun deleteFile(song: SongEntity): DeleteSongFileResult = withContext(ioDispatcher + newLogOperation("delete-file")) {
+-        val result = if (song.source == "SAF") {
++        val result = if (fileAccess.isWebDavUri(song.uri)) {
++            deleteWebDavSongFile(song)
++        } else if (song.source == "SAF") {
+             deleteSafSongFile(song)
+         } else {
+             deleteMediaStoreSongFile(song)
+@@ -59,7 +63,9 @@ class SongFileRepositoryImpl(
+         song: SongEntity,
+         newFileName: String
+     ): RenameSongFileResult = withContext(ioDispatcher + newLogOperation("rename-file")) {
+-        val result = if (song.source == "SAF") {
++        val result = if (fileAccess.isWebDavUri(song.uri)) {
++            renameWebDavSong(song, newFileName)
++        } else if (song.source == "SAF") {
+             renameSafSong(song, newFileName)
+         } else {
+             renameFilePathSong(song, newFileName)
+@@ -82,6 +88,42 @@ class SongFileRepositoryImpl(
+         result
+     }
+ 
++    private suspend fun deleteWebDavSongFile(song: SongEntity): DeleteSongFileResult {
++        return try {
++            if (webDavOperations.delete(song.uri)) {
++                DeleteSongFileResult.Deleted
++            } else {
++                DeleteSongFileResult.AlreadyMissing
++            }
++        } catch (e: FileNotFoundException) {
++            DeleteSongFileResult.AlreadyMissing
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to delete WebDAV song: ${song.uri}", e)
++            DeleteSongFileResult.Failed(e)
++        }
++    }
++
++    private suspend fun renameWebDavSong(
++        song: SongEntity,
++        newFileName: String
++    ): RenameSongFileResult {
++        return try {
++            val newUri = webDavOperations.rename(song.uri, newFileName)
++                ?: return RenameSongFileResult.NameConflict(targetName = newFileName)
++            val parentPath = song.filePath.substringBeforeLast("/", missingDelimiterValue = "")
++            val newPath = if (parentPath.isBlank()) newFileName else "$parentPath/$newFileName"
++            RenameSongFileResult.Success(
++                oldUri = song.uri,
++                newUri = newUri,
++                newFilePath = newPath,
++                newFileName = newFileName
++            )
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to rename WebDAV song: ${song.uri}", e)
++            RenameSongFileResult.Failed(e)
++        }
++    }
++
+     private suspend fun deleteSafSongFile(song: SongEntity): DeleteSongFileResult {
+         return try {
+             val uri = song.uri.toUri()
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/WebDavFileBridge.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/WebDavFileBridge.kt
+new file mode 100644
+index 0000000..3f97d07
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/file/WebDavFileBridge.kt
+@@ -0,0 +1,151 @@
++package com.lonx.lyrico.data.song.file
++
++import android.os.ParcelFileDescriptor
++import android.util.Log
++import com.lonx.lyrico.data.webdav.WebDavClient
++import com.lonx.lyrico.data.webdav.WebDavClientFactory
++import java.io.File
++import java.io.FileNotFoundException
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * 把远程 WebDAV 文件映射为可读写的本地临时文件。
++ *
++ * 标签读写链路（TagLib）只接受 ParcelFileDescriptor，所以这里把远程文件整体下载到
++ * 应用缓存目录再交给 TagLib 处理；写完后由 upload 把改动整体 PUT 回服务器。
++ * 每次打开都会重新下载，保证拿到的是服务器上的最新内容。
++ *
++ * 缓存文件生命周期：read 打开时创建，描述符关闭后由 release 删除；
++ * 万一进程被杀死，下次启动由 [clearStaleCache] 清理。
++ */
++class WebDavFileBridge(private val clientFactory: WebDavClientFactory) {
++
++    private class Handle(
++        val cacheFile: File,
++        val client: WebDavClient,
++        val relativePath: String,
++        val initialSize: Long,
++        val initialModified: Long,
++    ) {
++        fun isModified(): Boolean =
++            cacheFile.length() != initialSize || cacheFile.lastModified() != initialModified
++    }
++
++    private val handles = ConcurrentHashMap<Int, Handle>()
++
++    fun resolve(uriString: String): Pair<WebDavClient, String>? = clientFactory.resolve(uriString)
++
++    fun openReadable(uriString: String, cacheDir: File): ParcelFileDescriptor {
++        val (client, relativePath) = resolve(uriString)
++            ?: throw FileNotFoundException("WebDAV 连接不存在或已删除: $uriString")
++        val cacheFile = newCacheFile(cacheDir, relativePath)
++        downloadWithRetry(client, relativePath, cacheFile)
++        val descriptor = try {
++            ParcelFileDescriptor.open(cacheFile, ParcelFileDescriptor.MODE_READ_ONLY)
++        } catch (e: Exception) {
++            cacheFile.delete()
++            throw e
++        }
++        handles[descriptor.fd] = Handle(
++            cacheFile = cacheFile,
++            client = client,
++            relativePath = relativePath,
++            initialSize = cacheFile.length(),
++            initialModified = cacheFile.lastModified(),
++        )
++        return descriptor
++    }
++
++    fun openWritable(uriString: String, cacheDir: File): ParcelFileDescriptor {
++        val (client, relativePath) = resolve(uriString)
++            ?: throw FileNotFoundException("WebDAV 连接不存在或已删除: $uriString")
++        val cacheFile = newCacheFile(cacheDir, relativePath)
++        downloadWithRetry(client, relativePath, cacheFile)
++        val descriptor = try {
++            ParcelFileDescriptor.open(cacheFile, ParcelFileDescriptor.MODE_READ_WRITE)
++        } catch (e: Exception) {
++            cacheFile.delete()
++            throw e
++        }
++        handles[descriptor.fd] = Handle(
++            cacheFile = cacheFile,
++            client = client,
++            relativePath = relativePath,
++            initialSize = cacheFile.length(),
++            initialModified = cacheFile.lastModified(),
++        )
++        return descriptor
++    }
++
++    /** 把本地改动整体 PUT 回服务器。返回 true 表示确实上传了内容。 */
++    suspend fun upload(uriString: String, source: File): Boolean {
++        val (client, relativePath) = resolve(uriString) ?: throw FileNotFoundException(uriString)
++        client.upload(relativePath, source)
++        return true
++    }
++
++    /**
++     * 提交某个描述符对应的缓存文件改动。返回 true 表示发生了上传。
++     * 只对仍持有句柄的文件有效（通常紧接着写入之后调用）。
++     */
++    suspend fun commitHandle(descriptor: ParcelFileDescriptor): Boolean {
++        val handle = handles[descriptor.fd] ?: return false
++        if (!handle.isModified()) return false
++        handle.client.upload(handle.relativePath, handle.cacheFile)
++        return true
++    }
++
++    fun release(descriptor: ParcelFileDescriptor) {
++        val handle = handles.remove(descriptor.fd) ?: return
++        try {
++            descriptor.close()
++        } catch (e: Exception) {
++            Log.w(TAG, "关闭 WebDAV 描述符失败", e)
++        }
++        try {
++            if (!handle.cacheFile.delete()) {
++                Log.w(TAG, "删除 WebDAV 缓存失败: ${handle.cacheFile.absolutePath}")
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "删除 WebDAV 缓存异常", e)
++        }
++    }
++
++    /** 应用启动时清理上次遗留的缓存（描述符已失效）。 */
++    fun clearStaleCache(cacheDir: File) {
++        val dir = File(cacheDir, CACHE_SUBDIR)
++        if (!dir.exists()) return
++        dir.listFiles()?.forEach { file ->
++            runCatching { file.delete() }
++        }
++    }
++
++    private fun downloadWithRetry(client: WebDavClient, relativePath: String, cacheFile: File) {
++        var lastError: Exception? = null
++        for (attempt in 1..MAX_ATTEMPTS) {
++            try {
++                kotlinx.coroutines.runBlocking { client.download(relativePath, cacheFile) }
++                return
++            } catch (e: Exception) {
++                if (e is kotlinx.coroutines.CancellationException) throw e
++                lastError = e
++                Log.w(TAG, "WebDAV 下载失败（第 $attempt 次）: $relativePath", e)
++            }
++        }
++        cacheFile.delete()
++        throw lastError ?: FileNotFoundException(relativePath)
++    }
++
++    private fun newCacheFile(cacheDir: File, relativePath: String): File {
++        val dir = File(cacheDir, CACHE_SUBDIR).apply { mkdirs() }
++        val name = relativePath.substringAfterLast('/')
++        val extension = name.substringAfterLast('.', "tmp").take(8)
++        return File.createTempFile("wd-", ".$extension", dir)
++    }
++
++    private companion object {
++        const val TAG = "WebDavFileBridge"
++        const val CACHE_SUBDIR = "webdav-audio-cache"
++        const val MAX_ATTEMPTS = 2
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/LibraryScanRepositoryImpl.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/LibraryScanRepositoryImpl.kt
+index dd880c6..b672304 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/LibraryScanRepositoryImpl.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/LibraryScanRepositoryImpl.kt
+@@ -10,6 +10,8 @@ import com.lonx.audiotag.model.CustomTagField
+ import com.lonx.lyrico.data.LyricoDatabase
+ import com.lonx.lyrico.data.LibraryOperationLock
+ import com.lonx.lyrico.data.model.SongFile
++import com.lonx.lyrico.data.model.dao.ScanJournalDao
++import com.lonx.lyrico.data.model.entity.FolderEntity
+ import com.lonx.lyrico.data.model.entity.SongEntity
+ import com.lonx.lyrico.data.model.log.AppLogLevel
+ import com.lonx.lyrico.data.model.log.AppLogType
+@@ -20,6 +22,8 @@ import com.lonx.lyrico.data.song.mapper.SongMetadataMapper
+ import com.lonx.lyrico.data.song.search.LyricFtsIndexer
+ import com.lonx.lyrico.data.song.tag.AudioTagReadOptions
+ import com.lonx.lyrico.data.song.tag.AudioTagRepository
++import com.lonx.lyrico.data.webdav.WebDavScanner
++import com.lonx.lyrico.data.webdav.WebDavUri
+ import com.lonx.lyrico.utils.MediaScanner
+ import com.lonx.lyrico.utils.LyricsSearchTextExtractor
+ import com.lonx.lyrico.utils.UriUtils
+@@ -31,12 +35,14 @@ class LibraryScanRepositoryImpl(
+     private val context: Context,
+     private val database: LyricoDatabase,
+     private val mediaScanner: MediaScanner,
++    private val webDavScanner: WebDavScanner,
+     private val settingsRepository: SettingsRepository,
+     private val audioTagRepository: AudioTagRepository,
+     private val songMetadataMapper: SongMetadataMapper,
+     private val libraryIndexRepository: LibraryIndexRepository,
+     private val appLogRepository: AppLogRepository,
+-    private val operationLock: LibraryOperationLock
++    private val operationLock: LibraryOperationLock,
++    private val scanJournalDao: ScanJournalDao,
+ ) : LibraryScanRepository {
+ 
+     private val songDao = database.songDao()
+@@ -65,7 +71,10 @@ class LibraryScanRepositoryImpl(
+             onProgress(LibraryScanProgress(stage = LibraryScanStage.LISTING_FILES))
+ 
+             val removedSafFolders = if (request.removeMissingSafFolders) {
+-                removeSafFoldersWithoutPermission()
++                // WebDAV 根目录的权限来自账号，而不是 Android 的持久化 URI 授权，不能按 SAF 规则清理
++                removeSafFoldersWithoutPermission(
++                    safFolders = folderDao.getSafFolders(),
++                )
+             } else {
+                 0
+             }
+@@ -86,24 +95,56 @@ class LibraryScanRepositoryImpl(
+                 folderDao.getScanRootFoldersFor(request.folderIds)
+             }
+             val safFolderById = safFolders.associateBy { it.id }
+-            val safScanResult = mediaScanner.querySongsFromSafFolders(safFolders)
+-            val deviceSongs = safScanResult.songs
+-            safScanResult.failedFolderIds.forEach { folderId ->
++            val safOnlyFolders = safFolders.filterNot { WebDavUri.treeRoot(it.treeUri) != null }
++            val webDavFolders = safFolders.filter { WebDavUri.treeRoot(it.treeUri) != null }
++
++            val safScanResult = mediaScanner.querySongsFromSafFolders(safOnlyFolders)
++            val webDavScanResult = if (webDavFolders.isEmpty()) {
++                null
++            } else {
++                webDavScanner.scanFolders(webDavFolders)
++            }
++            val deviceSongs = safScanResult.songs.map { scanned ->
++                ScannedDeviceSong(
++                    songFile = scanned.songFile,
++                    rootFolderId = scanned.rootFolderId,
++                    folderPath = scanned.folderPath,
++                    source = "SAF",
++                )
++            } + webDavScanResult?.songs.orEmpty().map { scanned ->
++                ScannedDeviceSong(
++                    songFile = scanned.songFile,
++                    rootFolderId = scanned.rootFolderId,
++                    folderPath = scanned.folderPath,
++                    source = SOURCE_WEBDAV,
++                )
++            }
++            val successfulFolderIds = safScanResult.successfulFolderIds +
++                webDavScanResult?.successfulFolderIds.orEmpty()
++            val failedFolderIds = safScanResult.failedFolderIds + webDavScanResult?.failedFolderIds.orEmpty()
++            val missingFolderIds = safScanResult.missingFolderIds + webDavScanResult?.missingFolderIds.orEmpty()
++
++            failedFolderIds.forEach { folderId ->
+                 val folder = safFolderById.getValue(folderId)
+                 failures.add(
+                     LibraryScanFailure(
+                         uri = folder.treeUri,
+                         fileName = folder.path,
+                         stage = LibraryScanFailureStage.Collecting,
+-                        message = "无法读取目录，请检查存储状态和访问权限"
++                        message = if (WebDavUri.treeRoot(folder.treeUri) != null) {
++                            "无法访问 WebDAV 目录，请检查网络与账号权限"
++                        } else {
++                            "无法读取目录，请检查存储状态和访问权限"
++                        }
+                     )
+                 )
+             }
+             appLogRepository.recordOperation(AppLogType.APP, TAG, "Scan enumeration finished",
+                 "fullRescan=${request.fullRescan}\nignoreShortAudio=${request.ignoreShortAudio}\nindexLyrics=$indexLyrics\n" +
+                     "roots=${safFolders.map { it.id }}\nfiles=${deviceSongs.size}\n" +
+-                    "successfulRoots=${safScanResult.successfulFolderIds}\nfailedRoots=${safScanResult.failedFolderIds}\nmissingRoots=${safScanResult.missingFolderIds}",
+-                level = if (safScanResult.failedFolderIds.isEmpty()) AppLogLevel.DEBUG else AppLogLevel.WARNING)
++                    "successfulRoots=${successfulFolderIds}\nfailedRoots=${failedFolderIds}\nmissingRoots=${missingFolderIds}\n" +
++                        "webDavRoots=${webDavFolders.map { it.id }}",
++                level = if (failedFolderIds.isEmpty()) AppLogLevel.DEBUG else AppLogLevel.WARNING)
+ 
+             onProgress(
+                 LibraryScanProgress(
+@@ -113,10 +154,31 @@ class LibraryScanRepositoryImpl(
+                 )
+             )
+ 
++            // 工作日志：远程库扫描可能持续几十分钟，中途退出/断网后可以从这里续上，
++            // 已经处理完的文件不再重复下载与解析。
++            val journal = ScanJournalRecorder(
++                dao = scanJournalDao,
++                fullRescan = request.fullRescan,
++                scopeFolderIds = request.folderIds,
++            )
++            journal.start()
++            journal.setTotal(deviceSongs.size)
++            var resumedSkipped = 0
++
++            try {
+             for ((index, scannedSong) in deviceSongs.withIndex()) {
+                 val deviceSong = scannedSong.songFile
+                 try {
+                     val deviceUriString = deviceSong.uri.toString()
++                    if (!request.fullRescan && journal.isAlreadyDone(deviceUriString)) {
++                        // 上一轮已经完整处理过：直接保留既有记录，跳过网络请求
++                        resumedSkipped++
++                        deviceUris.add(deviceUriString)
++                        if (index % CHECKPOINT_EVERY == 0) {
++                            journal.checkpoint(LibraryScanStage.READING_METADATA.name, deviceSong.fileName)
++                        }
++                        continue
++                    }
+                     val dbInfo = dbSongMap[deviceUriString]
+                     val needsUpdate = request.fullRescan ||
+                         dbInfo == null ||
+@@ -153,7 +215,7 @@ class LibraryScanRepositoryImpl(
+                             songFile = deviceSong,
+                             folderId = folderId,
+                             existingId = dbInfo?.id ?: 0L,
+-                            source = "SAF",
++                            source = scannedSong.source,
+                             indexLyrics = indexLyrics
+                         )
+ 
+@@ -166,13 +228,31 @@ class LibraryScanRepositoryImpl(
+                             filteredShort++
+                             if (filteredShort <= 20) appLogRepository.recordOperation(AppLogType.APP, TAG, "Scan skipped short audio after tag read",
+                                 "uri=$deviceUriString\ndurationMs=${metadata.entity.durationMilliseconds}\nthresholdMs=$minDuration", deviceUriString)
++                            journal.recordSkipped(deviceUriString, deviceSong.fileName, metadata.entity.folderId, "short-audio")
+                             continue
+                         }
+ 
+-                        metadata?.let(songsToUpsert::add)
++                        metadata?.let { scanned ->
++                            songsToUpsert.add(scanned)
++                            journal.recordDone(
++                                uri = deviceUriString,
++                                fileName = deviceSong.fileName,
++                                folderId = scanned.entity.folderId,
++                                isInsert = scanned.isInsert,
++                            )
++                        }
++                        if (metadata == null) {
++                            journal.recordSkipped(deviceUriString, deviceSong.fileName, dbInfo?.folderId ?: 0L, "no-metadata")
++                        }
+                     } else {
+                         unchanged++
+                         if (indexLyrics) unchangedSongUris.add(deviceUriString)
++                        journal.recordDone(
++                            uri = deviceUriString,
++                            fileName = deviceSong.fileName,
++                            folderId = dbInfo?.folderId ?: scannedSong.rootFolderId,
++                            isInsert = false,
++                        )
+                     }
+ 
+                     deviceUris.add(deviceUriString)
+@@ -181,16 +261,30 @@ class LibraryScanRepositoryImpl(
+                     // The file was enumerated; a read failure alone cannot confirm its deletion.
+                     deviceUris.add(deviceSong.uri.toString())
+                     Log.e(TAG, "Failed to process song: ${deviceSong.fileName}", e)
++                    val message = e.message ?: e::class.java.simpleName
+                     failures.add(
+                         LibraryScanFailure(
+                             uri = deviceSong.uri.toString(),
+                             fileName = deviceSong.fileName,
+                             stage = LibraryScanFailureStage.ReadingMetadata,
+-                            message = e.message ?: e::class.java.simpleName,
++                            message = message,
+                             throwable = e
+                         )
+                     )
++                    // 失败也落库：续扫时不会永远卡在同一首坏文件上
++                    journal.recordFailed(
++                        uri = deviceSong.uri.toString(),
++                        fileName = deviceSong.fileName,
++                        folderId = dbSongMap[deviceSong.uri.toString()]?.folderId ?: 0L,
++                        message = message,
++                    )
+                 } finally {
++                    if ((index + 1) % CHECKPOINT_EVERY == 0 || index == deviceSongs.lastIndex) {
++                        journal.checkpoint(
++                            stage = LibraryScanStage.READING_METADATA.name,
++                            currentFile = deviceSong.fileName,
++                        )
++                    }
+                     onProgress(
+                         LibraryScanProgress(
+                             stage = LibraryScanStage.READING_METADATA,
+@@ -201,15 +295,22 @@ class LibraryScanRepositoryImpl(
+                     )
+                 }
+             }
++            } catch (e: kotlinx.coroutines.CancellationException) {
++                journal.pause("cancelled at ${journal.processedCount}/${deviceSongs.size}")
++                throw e
++            } catch (e: Exception) {
++                journal.fail(e.message ?: e::class.java.simpleName)
++                throw e
++            }
+ 
+-            val missingSafFolderIds = safScanResult.missingFolderIds
++            val missingSafFolderIds = missingFolderIds
+             val successfulScannedFolderIds = folderDao
+-                .getFolderTreeIds(safScanResult.successfulFolderIds)
++                .getFolderTreeIds(successfulFolderIds)
+                 .toSet()
+ 
+             val deletedUris = dbSyncInfos
+                 .filter { info ->
+-                    info.source == "SAF" &&
++                    info.source != "MEDIA_STORE" &&
+                         info.folderId in successfulScannedFolderIds &&
+                         info.uri !in deviceUris
+                 }
+@@ -217,7 +318,7 @@ class LibraryScanRepositoryImpl(
+                 .toSet()
+ 
+             val missingFolderSongUris = dbSyncInfos
+-                .filter { info -> info.source == "SAF" && info.folderId in missingSafFolderIds }
++                .filter { info -> info.source != "MEDIA_STORE" && info.folderId in missingSafFolderIds }
+                 .map { it.uri }
+                 .toSet()
+ 
+@@ -303,6 +404,11 @@ class LibraryScanRepositoryImpl(
+                 )
+             )
+ 
++            journal.finish()
++            if (resumedSkipped > 0) {
++                appLogRepository.recordOperation(AppLogType.APP, TAG, "Scan resumed",
++                    "journalId=${journal.journalId}\nresumedSkipped=$resumedSkipped\ntotal=${deviceSongs.size}")
++            }
+             if (failures.isEmpty()) settingsRepository.saveLastScanTime(System.currentTimeMillis())
+             val result = LibraryScanResult(
+                 scanned = deviceSongs.size,
+@@ -322,8 +428,9 @@ class LibraryScanRepositoryImpl(
+         }
+     }
+ 
+-    private suspend fun removeSafFoldersWithoutPermission(): Int {
+-        val foldersWithoutPermission = folderDao.getSafFoldersForPermissionCheck()
++    private suspend fun removeSafFoldersWithoutPermission(safFolders: List<FolderEntity>): Int {
++        val foldersWithoutPermission = safFolders
++            .filterNot { WebDavUri.treeRoot(it.treeUri) != null }
+             .filterNot { folder ->
+                 UriUtils.hasPersistedReadPermission(context, folder.treeUri)
+             }
+@@ -415,6 +522,13 @@ class LibraryScanRepositoryImpl(
+         }
+     }
+ 
++    private data class ScannedDeviceSong(
++        val songFile: SongFile,
++        val rootFolderId: Long,
++        val folderPath: String,
++        val source: String,
++    )
++
+     private data class ScannedSongMetadata(
+         val entity: SongEntity,
+         val customFields: List<CustomTagField>,
+@@ -424,5 +538,8 @@ class LibraryScanRepositoryImpl(
+     private companion object {
+         const val TAG = "LibraryScanRepository"
+         const val BATCH_SIZE = 50
++        const val SOURCE_WEBDAV = "WEBDAV"
++        /** 每处理多少个文件落一次进度，避免每个文件都写日志表拖慢扫描。 */
++        const val CHECKPOINT_EVERY = 20
+     }
+ }
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/ScanJournalRecorder.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/ScanJournalRecorder.kt
+new file mode 100644
+index 0000000..cd4ad4c
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/scan/ScanJournalRecorder.kt
+@@ -0,0 +1,150 @@
++package com.lonx.lyrico.data.song.scan
++
++import com.lonx.lyrico.data.model.dao.ScanJournalDao
++import com.lonx.lyrico.data.model.entity.ScanJournalEntity
++import com.lonx.lyrico.data.model.entity.ScanJournalItemEntity
++import com.lonx.lyrico.data.model.entity.ScanJournalItemStatus
++import com.lonx.lyrico.data.model.entity.ScanJournalStatus
++import java.util.UUID
++
++/**
++ * 可续作的扫描工作日志。
++ *
++ * 远程库扫描一次可能要几十分钟。没有日志时，用户中途退出或断网就只能从头再来，
++ * 已下载解析的标签全部作废。这里把“哪些文件已经处理完”落到数据库，
++ * 应用重启后可以直接从中断处继续，并把已完成的条目逐条回显给进度条，
++ * 让用户看到“续上了”而不是“又从头开始”。
++ *
++ * 设计要点：
++ * - 每个文件处理完立刻写一条 item（done/failed/skipped），不依赖批量提交；
++ * - journal 行的进度字段随处理推进更新，崩溃后最后一次进度仍可恢复；
++ * - 扫描被取消时不删日志，标 PAUSED，下次可继续；
++ * - 只保留最近若干条已结束日志，避免无限增长。
++ */
++class ScanJournalRecorder(
++    private val dao: ScanJournalDao,
++    private val fullRescan: Boolean,
++    private val scopeFolderIds: Set<Long>?,
++) {
++    private var journalIdValue: String = UUID.randomUUID().toString()
++    private var inserted = 0
++    private var updated = 0
++    private var failed = 0
++    private var skipped = 0
++    private var processed = 0
++    private var total = -1
++    private val completedUris = mutableSetOf<String>()
++
++    val journalId: String get() = journalIdValue
++
++    /** 本期刊是否已完成过某个 uri（续扫时用于跳过）。 */
++    fun isAlreadyDone(uri: String): Boolean = uri in completedUris
++
++    suspend fun start(): String {
++        val resumable = dao.getResumableJournal()
++        if (resumable != null && resumable.fullRescan == fullRescan && resumable.scopeFolderIds == scopeKey()) {
++            // 结构完全一致的工作可以直接续上
++            journalIdValue = resumable.journalId
++            inserted = resumable.insertedCount
++            updated = resumable.updatedCount
++            failed = resumable.failedCount
++            skipped = resumable.skippedCount
++            processed = resumable.processedFiles
++            total = resumable.totalFiles
++            completedUris += dao.getCompletedUris(resumable.journalId)
++            dao.updateStatus(resumable.journalId, ScanJournalStatus.RUNNING)
++        } else {
++            daoSafe { dao.markAllRunningAsPaused() }
++            dao.upsertJournal(
++                ScanJournalEntity(
++                    journalId = journalIdValue,
++                    scopeFolderIds = scopeKey(),
++                    status = ScanJournalStatus.RUNNING,
++                    fullRescan = fullRescan,
++                )
++            )
++        }
++        return journalIdValue
++    }
++
++    suspend fun setTotal(count: Int) {
++        total = count
++        persist(null, null)
++    }
++
++    suspend fun recordDone(uri: String, fileName: String, folderId: Long, isInsert: Boolean) {
++        processed++
++        if (isInsert) inserted++ else updated++
++        completedUris += uri
++        dao.upsertItem(
++            ScanJournalItemEntity(
++                journalId = journalIdValue, uri = uri, fileName = fileName,
++                folderId = folderId, status = ScanJournalItemStatus.DONE,
++            )
++        )
++    }
++
++    suspend fun recordFailed(uri: String, fileName: String, folderId: Long, message: String?) {
++        processed++
++        failed++
++        dao.upsertItem(
++            ScanJournalItemEntity(
++                journalId = journalIdValue, uri = uri, fileName = fileName,
++                folderId = folderId, status = ScanJournalItemStatus.FAILED, message = message,
++            )
++        )
++    }
++
++    suspend fun recordSkipped(uri: String, fileName: String, folderId: Long, message: String?) {
++        processed++
++        skipped++
++        dao.upsertItem(
++            ScanJournalItemEntity(
++                journalId = journalIdValue, uri = uri, fileName = fileName,
++                folderId = folderId, status = ScanJournalItemStatus.SKIPPED, message = message,
++            )
++        )
++    }
++
++    /** 周期性调用（例如每 20 个文件）刷新进度，避免每个文件都写一行 journal。 */
++    suspend fun checkpoint(stage: String?, currentFile: String?) {
++        persist(stage, currentFile)
++    }
++
++    suspend fun finish() {
++        persist(null, null)
++        dao.updateStatus(journalIdValue, ScanJournalStatus.FINISHED, finishedAt = System.currentTimeMillis())
++        daoSafe { dao.pruneOldJournals() }
++    }
++
++    suspend fun pause(reason: String? = null) {
++        persist(null, null)
++        dao.updateStatus(journalIdValue, ScanJournalStatus.PAUSED, error = reason)
++    }
++
++    suspend fun fail(error: String) {
++        dao.updateStatus(journalIdValue, ScanJournalStatus.FAILED, error = error, finishedAt = System.currentTimeMillis())
++    }
++
++    val processedCount: Int get() = processed
++
++    private suspend fun persist(stage: String?, currentFile: String?) {
++        dao.updateProgress(
++            journalId = journalIdValue,
++            totalFiles = total,
++            processed = processed,
++            inserted = inserted,
++            updated = updated,
++            failed = failed,
++            skipped = skipped,
++            stage = stage,
++            currentFile = currentFile,
++        )
++    }
++
++    private fun scopeKey(): String? = scopeFolderIds?.sorted()?.joinToString(",")
++
++    private inline fun daoSafe(block: () -> Unit) {
++        runCatching(block)
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/tag/AudioTagRepositoryImpl.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/tag/AudioTagRepositoryImpl.kt
+index 66207ce..ab65f45 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/song/tag/AudioTagRepositoryImpl.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/song/tag/AudioTagRepositoryImpl.kt
+@@ -96,12 +96,15 @@ class AudioTagRepositoryImpl(
+                             is PictureWriteCommand.ReplaceAll -> "replace-all count=${pictures.pictures.size} types=${pictures.pictures.map { it.type }}"
+                         }}", uri)
+                 stage = "open-writable-descriptor"
++                val webDavDescriptorRef = java.util.concurrent.atomic.AtomicReference<android.os.ParcelFileDescriptor>()
+                 val writableDescriptor = fileAccess.openWritableDescriptor(uri, trace)
+                     ?: return@attempt AudioTagWriteResult.Failed(
+                         IllegalStateException("Unable to open writable descriptor")
+                     )
+ 
++                val isWebDav = fileAccess.isWebDavUri(uri)
+                 writableDescriptor.use { descriptor ->
++                    webDavDescriptorRef.set(descriptor)
+                     if (resolved.tags.isNotEmpty()) {
+                         stage = "write-tags"
+                         val tagsWritten = AudioTagWriter.writeTags(
+@@ -133,6 +136,19 @@ class AudioTagRepositoryImpl(
+                     }
+                 }
+ 
++                // WebDAV：缓存文件里已经是改好的完整音频，整体 PUT 回服务器。
++                // 上传失败要在 read-back 之前抛出，否则会把“服务器上其实没改动”误报为成功。
++                stage = "upload-webdav"
++                if (isWebDav) {
++                    webDavDescriptorRef.get()?.let { descriptor ->
++                        try {
++                            fileAccess.commitWebDavDescriptor(descriptor)
++                        } finally {
++                            fileAccess.releaseWebDavDescriptor(descriptor)
++                        }
++                    }
++                }
++
+                 stage = "read-back"
+                 AudioTagWriteResult.Success(readStrict(uri))
+             }
+@@ -169,18 +185,24 @@ class AudioTagRepositoryImpl(
+     ): AudioTagData {
+         val accessTrace = mutableListOf<String>()
+         var stage = "open-readable-descriptor"
++        val isRemote = fileAccess.isWebDavUri(uri)
+         try {
+-            fileAccess.openReadableDescriptor(uri) { if (accessTrace.size < 8) accessTrace += it }?.use { descriptor ->
+-                stage = "read-taglib"
+-                return AudioTagReader.read(
+-                    pfd = descriptor,
+-                    readPictures = true,
+-                    multiValueSeparator = options.multiValueSeparator,
+-                    strict = strict
+-                ).copy(fileName = displayName).also { data ->
+-                    appLogRepository.recordOperation(AppLogType.METADATA, TAG, "Audio tags read",
+-                        "uri=$uri\nname=$displayName\nstrict=$strict\ndurationMs=${data.durationMilliseconds}\n" +
+-                            "pictures=${data.pictures.map { it.type }}\nlyricsChars=${data.lyrics?.length ?: 0}\ncustomKeys=${data.customFields.map { it.key }}", uri)
++            fileAccess.openReadableDescriptor(uri) { if (accessTrace.size < 8) accessTrace += it }?.let { descriptor ->
++                try {
++                    stage = "read-taglib"
++                    return AudioTagReader.read(
++                        pfd = descriptor,
++                        readPictures = true,
++                        multiValueSeparator = options.multiValueSeparator,
++                        strict = strict
++                    ).copy(fileName = displayName).also { data ->
++                        appLogRepository.recordOperation(AppLogType.METADATA, TAG, "Audio tags read",
++                            "uri=$uri\nname=$displayName\nstrict=$strict\ndurationMs=${data.durationMilliseconds}\n" +
++                                "pictures=${data.pictures.map { it.type }}\nlyricsChars=${data.lyrics?.length ?: 0}\ncustomKeys=${data.customFields.map { it.key }}", uri)
++                    }
++                } finally {
++                    // WebDAV 是下载到本地缓存的临时文件，用完立刻清掉
++                    if (isRemote) fileAccess.releaseWebDavDescriptor(descriptor)
+                 }
+             }
+             stage = "read-stream-cache"
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
+new file mode 100644
+index 0000000..94a0b98
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
+@@ -0,0 +1,497 @@
++package com.lonx.lyrico.data.webdav
++
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import okhttp3.Credentials
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody
++import okhttp3.RequestBody.Companion.asRequestBody
++import okhttp3.RequestBody.Companion.toRequestBody
++import okhttp3.Response
++import org.w3c.dom.Element
++import java.io.File
++import java.io.IOException
++import java.io.InputStream
++import java.io.UnsupportedEncodingException
++import java.net.URLEncoder
++import java.util.concurrent.TimeUnit
++import javax.xml.parsers.DocumentBuilderFactory
++
++/** 一个 WebDAV 远程文件/目录条目，路径为相对扫描根目录的路径（例如 "专辑/01.flac"）。 */
++data class WebDavEntry(
++    val relativePath: String,
++    val name: String,
++    val isDirectory: Boolean,
++    val size: Long = 0L,
++    val lastModified: Long = 0L,
++    /** 服务器上的绝对路径（不含前导 /），内部用于映射回相对路径。 */
++    val absolutePath: String = "",
++)
++
++class WebDavException(message: String, val code: Int, val url: String? = null) : IOException(message)
++
++/**
++ * 极简 WebDAV 客户端。只实现 Lyrico 需要的动作：
++ * PROPFIND 枚举、GET 完整下载、PUT 整体替换上传、DELETE、MOVE。
++ *
++ * 注意：标签写入走“下载 → 本地改 → PUT 回去”的整文件替换，不做 Range 分块写。
++ * 原因很简单：Range PUT 不是 WebDAV 标准能力（RFC 4918 没有部分写语义），
++ * 服务端实现五花八门，写坏文件的概率远高于收益。
++ */
++class WebDavClient(
++    serverUrl: String,
++    userName: String,
++    password: String,
++    private val basePath: String = "/",
++    private val timeoutSeconds: Long = 60L,
++) {
++    val baseUrl = normalizeBaseUrl(serverUrl)
++
++    private val authHeader: String? = if (userName.isNotBlank() || password.isNotBlank()) {
++        Credentials.basic(userName, password, Charsets.UTF_8)
++    } else {
++        null
++    }
++
++    private val client: OkHttpClient = OkHttpClient.Builder()
++        .connectTimeout(20, TimeUnit.SECONDS)
++        .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
++        .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
++        .callTimeout(0, TimeUnit.MILLISECONDS)
++        .followRedirects(true)
++        .followSslRedirects(true)
++        .retryOnConnectionFailure(true)
++        .build()
++
++    private val rootMutex = Mutex()
++
++    @Volatile
++    private var rootPathCache: String? = null
++
++    /** 扫描根目录（服务器上的绝对路径，始终以 / 开头、不以 / 结尾，根目录为 ""）。 */
++    suspend fun resolveRootPath(): String {
++        rootPathCache?.let { return it }
++        return rootMutex.withLock {
++            rootPathCache ?: run {
++                val resolved = if (basePath.isBlank() || basePath == "/") {
++                    ""
++                } else {
++                    canonicalPath(basePath.removePrefix("/").trimEnd('/'))
++                }
++                rootPathCache = resolved
++                resolved
++            }
++        }
++    }
++
++    // ---------------------------------------------------------------- 枚举
++
++    override fun toString(): String = "WebDavClient($baseUrl)"
++
++    suspend fun propfind(relativeDir: String, depth: Int = 1): List<WebDavEntry> = withContext(Dispatchers.IO) {
++        // 注意：这里不能调用 resolveRootPath()，否则 canonicalPath() 的逐级探测会递归死锁。
++        val requested = normalizeRelative(relativeDir)
++        val target = resolveRootPath().let { root -> if (root.isEmpty()) requested else if (requested.isEmpty()) root else "$root/$requested" }
++        val url = buildUrlAbsolute(target, directory = true)
++        val requestBody = REQUEST_ALL.toRequestBody(MEDIA_TYPE_XML)
++        val request = authorized(Request.Builder().url(url).method("PROPFIND", requestBody))
++            .header("Depth", depth.toString())
++            .build()
++
++        val entries = executeWithAuthRetry(request) { response ->
++            if (response.code != 207 && !response.isSuccessful) {
++                throw WebDavException("PROPFIND 失败：HTTP ${response.code}", response.code, url)
++            }
++            val xml = response.peekBody(PROPFIND_BODY_LIMIT)?.bytes() ?: ByteArray(0)
++            parseMultiStatus(xml)
++        }
++
++        val prefix = if (target.isEmpty()) "" else "$target/"
++        entries.mapNotNull { raw ->
++            val normalized = raw.absolutePath.trim('/')
++            if (normalized.isEmpty()) return@mapNotNull null
++            // target 是 serverBasePath + 请求目录，按它切成相对路径即可。
++            val relative = when {
++                prefix.isNotEmpty() && normalized.startsWith(prefix) -> normalized.removePrefix(prefix)
++                normalized == target -> "" // 自身，丢弃
++                else -> normalized
++            }
++            if (relative.isEmpty()) null
++            else raw.copy(relativePath = relative, absolutePath = normalized)
++        }
++    }
++
++    /**
++     * 仅用于探测根路径是否存在且可访问。
++     */
++    /** 探测服务器上某个绝对路径（不含前导 /）是否为可访问目录。 */
++    suspend fun probe(absolutePath: String): Boolean = withContext(Dispatchers.IO) {
++        val url = buildUrlAbsolute(absolutePath, directory = true)
++        val request = authorized(
++            Request.Builder().url(url).method("PROPFIND", REQUEST_ALL.toRequestBody(MEDIA_TYPE_XML))
++        ).header("Depth", "0").build()
++        try {
++            executeWithAuthRetry(request) { response ->
++                when {
++                    response.code == 207 -> true
++                    response.code == 404 -> false
++                    else -> throw WebDavException("PROPFIND 失败：HTTP ${response.code}", response.code, url)
++                }
++            }
++        } catch (e: WebDavException) {
++            throw e
++        } catch (e: IOException) {
++            throw WebDavException("无法连接 WebDAV 服务器：${e.message}", 0, url)
++        }
++    }
++
++    /** 根目录是否存在（HTTP 404 表示不存在，其它错误抛出）。 */
++    suspend fun rootExists(): Boolean = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(root, directory = true)
++        val request = authorized(
++            Request.Builder().url(url).method("PROPFIND", REQUEST_ALL.toRequestBody(MEDIA_TYPE_XML))
++        ).header("Depth", "0").build()
++        executeWithAuthRetry(request) { response ->
++            when (response.code) {
++                207 -> true
++                404 -> false
++                401, 403 -> throw WebDavException("认证或权限不足：HTTP ${response.code}", response.code, url)
++                else -> throw WebDavException("WebDAV 请求失败：HTTP ${response.code}", response.code, url)
++            }
++        }
++    }
++
++    /** 下载整个文件到本地临时文件。 */
++    suspend fun download(relativePath: String, destination: File): Long = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath))
++        val request = authorized(Request.Builder().url(url).get()).build()
++        executeWithAuthRetry(request) { response ->
++            if (!response.isSuccessful) {
++                throw WebDavException("下载失败：HTTP ${response.code}", response.code, url)
++            }
++            val body = response.body ?: throw WebDavException("下载响应为空", response.code, url)
++            destination.parentFile?.mkdirs()
++            destination.outputStream().use { output ->
++                body.byteStream().use { input -> input.copyTo(output, DEFAULT_BUFFER_SIZE) }
++            }
++            destination.length()
++        }
++    }
++
++    /** 直接用 GET 流读取（不落地）。调用方负责关闭。 */
++    suspend fun openStream(relativePath: String): InputStream = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath))
++        val request = authorized(Request.Builder().url(url).get()).build()
++        val response = client.newCall(request).execute()
++        if (!response.isSuccessful) {
++            response.close()
++            throw WebDavException("读取失败：HTTP ${response.code}", response.code, url)
++        }
++        response.body?.byteStream() ?: throw WebDavException("读取响应为空", response.code, url)
++    }
++
++    /** 整体替换上传（PUT）。 */
++    suspend fun upload(relativePath: String, source: File, contentType: String? = null) = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath))
++        val mediaType = (contentType ?: guessMimeType(relativePath)).toMediaType()
++        uploadBody(relativePath, url, source.asRequestBody(mediaType))
++    }
++
++    suspend fun upload(relativePath: String, bytes: ByteArray, contentType: String? = null) = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath))
++        val mediaType = (contentType ?: guessMimeType(relativePath)).toMediaType()
++        uploadBody(relativePath, url, bytes.toRequestBody(mediaType))
++    }
++
++    private suspend fun uploadBody(relativePath: String, url: String, body: RequestBody) {
++        ensureDirectories(normalizeRelative(relativePath).substringBeforeLast('/', missingDelimiterValue = ""))
++        val request = authorized(Request.Builder().url(url).put(body)).build()
++        executeWithAuthRetry(request) { response ->
++            if (!response.isSuccessful) {
++                throw WebDavException("上传失败：HTTP ${response.code}", response.code, url)
++            }
++            response.code
++        }
++    }
++
++    suspend fun delete(relativePath: String, isDirectory: Boolean = false): Boolean = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath), directory = isDirectory)
++        val request = authorized(Request.Builder().url(url).delete()).build()
++        executeWithAuthRetry(request) { response ->
++            when {
++                response.isSuccessful -> true
++                response.code == 404 -> false
++                else -> throw WebDavException("删除失败：HTTP ${response.code}", response.code, url)
++            }
++        }
++    }
++
++    suspend fun move(sourceRelativePath: String, targetRelativePath: String, overwrite: Boolean = false): Boolean =
++        withContext(Dispatchers.IO) {
++            val root = resolveRootPath()
++            // 文件名可能变化，避免服务端因为缺少路径分段而困惑
++            val sourceUrl = buildUrlAbsolute(joinRelative(root, sourceRelativePath))
++            val targetUrl = buildUrlAbsolute(joinRelative(root, targetRelativePath))
++            val request = authorized(Request.Builder().url(sourceUrl).method("MOVE", EMPTY_BODY))
++                .header("Destination", targetUrl)
++                .header("Overwrite", if (overwrite) "T" else "F")
++                .build()
++            executeWithAuthRetry(request) { response ->
++                when {
++                    response.code == 201 || response.code == 204 -> true
++                    response.code == 412 -> false // 目标已存在且未允许覆盖
++                    response.isSuccessful -> true
++                    else -> throw WebDavException("重命名失败：HTTP ${response.code}", response.code, sourceUrl)
++                }
++            }
++        }
++
++    suspend fun exists(relativePath: String): Boolean = withContext(Dispatchers.IO) {
++        val root = resolveRootPath()
++        val url = buildUrlAbsolute(joinRelative(root, relativePath))
++        val request = authorized(Request.Builder().url(url).head()).build()
++        executeWithAuthRetry(request) { response ->
++            when (response.code) {
++                200 -> true
++                404, 405 -> false // 405：部分服务端不支持 HEAD，交给调用方按 PROPFIND 处理
++                else -> throw WebDavException("HEAD 失败：HTTP ${response.code}", response.code, url)
++            }
++        }
++    }
++
++    // ---------------------------------------------------------------- 内部
++
++    private fun authorized(builder: Request.Builder): Request.Builder =
++        builder.apply {
++            header("User-Agent", "Lyrico-WebDAV/1.0")
++            authHeader?.let { header("Authorization", it) }
++        }
++
++    private suspend fun <T> executeWithAuthRetry(request: Request, handler: (Response) -> T): T {
++        // 响应体可能被 handler 消费；每次调用都持有独立 response，消费完由调用方/这里统一关闭。
++        var response = client.newCall(request).execute()
++        return try {
++            // 某些服务端不接受抢先式 Basic 认证（返回 401 + WWW-Authenticate），
++            // 重试一次即可，携带同样的 Authorization 头。
++            if (response.code == 401 && authHeader != null) {
++                response.close()
++                response = client.newCall(request).execute()
++            }
++            handler(response)
++        } finally {
++            response.close()
++        }
++    }
++
++    /** 逐级 MKCOL，已存在则忽略（301/405 表示已存在）。调用方传入相对于扫描根的目录。 */
++    private suspend fun ensureDirectories(relativeDir: String) {
++        val requested = normalizeRelative(relativeDir)
++        if (requested.isEmpty()) return
++        val target = joinRelative(resolveRootPath(), requested)
++        var current = ""
++        for (segment in target.split('/').filter { it.isNotBlank() }) {
++            current = if (current.isEmpty()) segment else "$current/$segment"
++            val url = buildUrlAbsolute(current, directory = true)
++            try {
++                val request = authorized(Request.Builder().url(url).method("MKCOL", EMPTY_BODY)).build()
++                client.newCall(request).execute().use { response ->
++                    if (response.code !in intArrayOf(200, 201, 204, 301, 405)) {
++                        Log.w(TAG, "MKCOL $current -> HTTP ${response.code}")
++                    }
++                }
++            } catch (e: IOException) {
++                Log.w(TAG, "MKCOL 失败: $current", e)
++            }
++        }
++    }
++
++    /**
++     * 把配置里的路径规范化成服务器上的真实大小写路径。
++     *
++     * 很多 WebDAV 服务（群晖、Nextcloud、Alist）路径大小写敏感，用户手输经常大小写不符；
++     * 这里逐级探测父目录，每次只多一次 Depth:0 请求，且只在第一次扫描时发生。
++     * 探测失败（例如没有父目录列目录权限）时按原样使用，不阻塞扫描。
++     */
++    private suspend fun canonicalPath(raw: String): String {
++        val segments = raw.split('/').filter { it.isNotBlank() }
++        if (segments.isEmpty()) return ""
++
++        var resolved = ""
++        for (segment in segments) {
++            val candidate = if (resolved.isEmpty()) segment else "$resolved/$segment"
++            val exactOk = runCatching { probe(candidate) }.getOrDefault(false)
++            if (exactOk) {
++                resolved = candidate
++                continue
++            }
++            val siblings = runCatching { propfind(resolved) }.getOrNull().orEmpty()
++            val matched = siblings.firstOrNull { it.name == segment }
++                ?: siblings.firstOrNull { it.name.equals(segment, ignoreCase = true) }
++            val actual = matched?.name ?: segment
++            resolved = if (resolved.isEmpty()) actual else "$resolved/$actual"
++        }
++        return resolved
++    }
++
++    fun buildUrlAbsolute(absolutePath: String, directory: Boolean = false): String {
++        val encoded = absolutePath.split('/').filter { it.isNotBlank() }
++            .joinToString("/") { encodePathSegment(it) }
++        val base = baseUrl.trimEnd('/')
++        return if (encoded.isEmpty()) "$base/" else "$base/$encoded" + if (directory) "/" else ""
++    }
++
++    /**
++     * 相对扫描根的路径 → 完整 URL。
++     * 这里刻意不读取根路径缓存：baseUrl 已经是用户配置的服务器根，相对路径直接拼即可。
++     */
++    fun buildUrl(relativePath: String, directory: Boolean = false): String =
++        buildUrlAbsolute(normalizeRelative(relativePath), directory)
++
++    private fun parseMultiStatus(xml: ByteArray): List<WebDavEntry> {
++        if (xml.isEmpty()) return emptyList()
++        return try {
++            val factory = DocumentBuilderFactory.newInstance().apply {
++                isNamespaceAware = true
++                setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
++                isExpandEntityReferences = false
++            }
++            val document = factory.newDocumentBuilder().parse(xml.inputStream())
++            val responses = document.getElementsByTagNameNS("*", "response")
++            val result = mutableListOf<WebDavEntry>()
++            for (i in 0 until responses.length) {
++                val response = responses.item(i) as? Element ?: continue
++                val href = response.textOfFirst("href") ?: continue
++                val prop = firstElement(response, "prop") ?: response
++                val isCollection = firstElement(prop, "resourcetype")
++                    ?.let { firstElement(it, "collection") } != null
++                val name = decodeHrefName(href)
++                val size = prop.textOfFirst("getcontentlength")?.toLongOrNull() ?: 0L
++                val modified = prop.textOfFirst("getlastmodified")?.let(::parseHttpDate) ?: 0L
++                result += WebDavEntry(
++                    relativePath = "",
++                    name = name,
++                    isDirectory = isCollection,
++                    size = size,
++                    lastModified = modified,
++                    absolutePath = hrefToAbsolutePath(href),
++                )
++            }
++            result
++        } catch (e: Exception) {
++            Log.w(TAG, "解析 PROPFIND 响应失败", e)
++            throw WebDavException("解析服务器响应失败：${e.message}", 207)
++        }
++    }
++
++    /** 把 href（可能是绝对 URL 或绝对路径）转换成服务器绝对路径（不含前导 /）。 */
++    fun hrefToAbsolutePath(href: String): String {
++        val decoded = runCatching { java.net.URI(href).path }.getOrNull() ?: href
++        val basePathPart = runCatching { java.net.URI(baseUrl).path }.getOrNull().orEmpty().trimEnd('/')
++        val withoutBase = if (basePathPart.isNotEmpty() && decoded.startsWith(basePathPart)) {
++            decoded.removePrefix(basePathPart)
++        } else {
++            decoded
++        }
++        return decodePath(withoutBase).trim('/')
++    }
++
++    private fun Element.textOfFirst(tag: String): String? =
++        firstElement(this, tag)?.textContent?.trim()?.takeIf { it.isNotEmpty() }
++
++    private fun firstElement(parent: Element, tag: String): Element? {
++        val byNs = parent.getElementsByTagNameNS("*", tag)
++        if (byNs.length > 0) return byNs.item(0) as? Element
++        val byName = parent.getElementsByTagName(tag)
++        return if (byName.length > 0) byName.item(0) as? Element else null
++    }
++
++    private fun decodeHrefName(href: String): String {
++        val path = runCatching { java.net.URI(href).path }.getOrNull() ?: href
++        val trimmed = path.trimEnd('/')
++        return decodePath(trimmed.substringAfterLast('/'))
++    }
++
++    companion object {
++        private const val TAG = "WebDavClient"
++        private const val REQUEST_ALL = """<?xml version="1.0" encoding="utf-8"?>
++<d:propfind xmlns:d="DAV:">
++  <d:prop>
++    <d:resourcetype/>
++    <d:getcontentlength/>
++    <d:getlastmodified/>
++  </d:prop>
++</d:propfind>"""
++        private val MEDIA_TYPE_XML = "application/xml; charset=utf-8".toMediaType()
++        private const val PROPFIND_BODY_LIMIT = 64L * 1024 * 1024
++        private val EMPTY_BODY = ByteArray(0).toRequestBody(null)
++
++        val AUDIO_EXTENSIONS = setOf(
++            "mp3", "flac", "m4a", "ogg", "opus", "wav", "aac", "wma", "ape",
++        )
++
++        fun normalizeBaseUrl(raw: String): String {
++            var url = raw.trim()
++            if (!url.contains("://")) url = "https://$url"
++            url = url.trimEnd('/')
++            return if (url.endsWith("/dav") || url.endsWith(".php")) url else url
++        }
++
++        fun normalizeRelative(path: String): String =
++            path.replace('\\', '/').trim().trim('/').split('/').filter { it.isNotBlank() }.joinToString("/")
++
++        fun joinRelative(root: String, relative: String): String {
++            val r = normalizeRelative(relative)
++            return if (root.isEmpty()) r else if (r.isEmpty()) root else "$root/$r"
++        }
++
++        fun isAudioFile(name: String): Boolean =
++            name.substringAfterLast('.', "").lowercase() in AUDIO_EXTENSIONS
++
++        fun encodePathSegment(segment: String): String = try {
++            URLEncoder.encode(segment, "UTF-8").replace("+", "%20")
++        } catch (e: UnsupportedEncodingException) {
++            segment
++        }
++
++        fun decodePath(path: String): String = try {
++            java.net.URLDecoder.decode(path, "UTF-8")
++        } catch (e: Exception) {
++            path
++        }
++
++        fun guessMimeType(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
++            "mp3" -> "audio/mpeg"
++            "flac" -> "audio/flac"
++            "m4a", "aac" -> "audio/mp4"
++            "ogg", "opus" -> "audio/ogg"
++            "wav" -> "audio/wav"
++            "wma" -> "audio/x-ms-wma"
++            "ape" -> "audio/x-ape"
++            else -> "application/octet-stream"
++        }
++
++        fun parseHttpDate(value: String): Long = runCatching {
++            val format = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
++            format.timeZone = java.util.TimeZone.getTimeZone("GMT")
++            format.parse(value)?.time ?: 0L
++        }.getOrDefault(0L)
++
++        /** 供 UI 使用：判断一个字符串是否是合法的 WebDAV 地址。 */
++        fun isValidUrl(raw: String): Boolean {
++            val candidate = if (raw.contains("://")) raw.trim() else "https://${raw.trim()}"
++            return candidate.toHttpUrlOrNull() != null
++        }
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavConfig.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavConfig.kt
+new file mode 100644
+index 0000000..b46363a
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavConfig.kt
+@@ -0,0 +1,103 @@
++package com.lonx.lyrico.data.webdav
++
++import android.content.SharedPreferences
++import androidx.core.content.edit
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.map
++import kotlinx.serialization.Serializable
++import kotlinx.serialization.json.Json
++
++@Serializable
++data class WebDavConfig(
++    val id: String,
++    val serverUrl: String,
++    val userName: String,
++    val password: String,
++    val basePath: String = "/",
++) {
++    /** 只用于日志与 UI，不包含密码。 */
++    override fun toString(): String = "WebDavConfig(id=$id, url=$serverUrl, user=$userName, path=$basePath)"
++}
++
++/**
++ * WebDAV 连接配置存储。凭据放在应用私有 SharedPreferences 中，
++ * 没有走 Room，避免凭据进入可导出的数据库/日志备份。
++ */
++class WebDavConfigStore(private val prefs: SharedPreferences) {
++
++    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
++    private val changes = MutableStateFlow(prefs.getLong(KEY_VERSION, 0L))
++
++    val versionFlow = changes.map { prefs.getLong(KEY_VERSION, 0L) }
++
++    fun all(): List<WebDavConfig> {
++        val raw = prefs.getString(KEY_ITEMS, null) ?: return emptyList()
++        return runCatching {
++            json.decodeFromString<List<WebDavConfig>>(raw)
++        }.getOrDefault(emptyList())
++    }
++
++    fun get(id: String?): WebDavConfig? = id?.let { target -> all().firstOrNull { it.id == target } }
++
++    fun getByRootUri(rootUri: String?): WebDavConfig? {
++        val id = WebDavUri.parseRootUri(rootUri)?.connectionId ?: return null
++        return get(id)
++    }
++
++    fun save(config: WebDavConfig): WebDavConfig {
++        val normalized = config.copy(id = config.id.ifBlank { newId() })
++        val items = all().toMutableList()
++        val index = items.indexOfFirst { it.id == normalized.id }
++        if (index >= 0) items[index] = normalized else items.add(normalized)
++        write(items)
++        return normalized
++    }
++
++    fun delete(id: String) {
++        write(all().filterNot { it.id == id })
++    }
++
++    fun newId(): String = "wd" + System.currentTimeMillis().toString(36) +
++        Integer.toHexString((0..0xFFFF).random())
++
++    private fun write(items: List<WebDavConfig>) {
++        prefs.edit(commit = true) {
++            putString(KEY_ITEMS, json.encodeToString(items))
++            putLong(KEY_VERSION, System.currentTimeMillis())
++        }
++        changes.value = System.currentTimeMillis()
++    }
++
++    private companion object {
++        const val KEY_ITEMS = "webdav_connections"
++        const val KEY_VERSION = "webdav_version"
++    }
++}
++
++/**
++ * 连接缓存：按配置内容缓存 WebDavClient，避免每次 URL 解析都重建 OkHttp 连接池。
++ */
++class WebDavClientFactory(private val store: WebDavConfigStore) {
++
++    private val cache = LinkedHashMap<String, WebDavClient>()
++
++    fun byConfig(config: WebDavConfig): WebDavClient = synchronized(cache) {
++        val key = "${config.serverUrl}|${config.userName}|${config.password}|${config.basePath}"
++        cache[key] ?: WebDavClient(
++            serverUrl = config.serverUrl,
++            userName = config.userName,
++            password = config.password,
++            basePath = config.basePath,
++        ).also {
++            if (cache.size > 8) cache.remove(cache.keys.first())
++            cache[key] = it
++        }
++    }
++
++    /** 从歌曲 uri（lyricowebdav://<connectionId>/<相对路径>）解析客户端与相对路径。 */
++    fun resolve(uriString: String): Pair<WebDavClient, String>? {
++        val parsed = WebDavUri.parseFileUri(uriString) ?: return null
++        val config = store.get(parsed.connectionId) ?: return null
++        return byConfig(config) to parsed.relativePath
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavFileOperations.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavFileOperations.kt
+new file mode 100644
+index 0000000..194f3c8
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavFileOperations.kt
+@@ -0,0 +1,52 @@
++package com.lonx.lyrico.data.webdav
++
++import android.util.Log
++import java.io.File
++import java.io.FileNotFoundException
++
++/**
++ * 远程文件操作门面：删除、MOVE 重命名、把本地改好的文件 PUT 回去。
++ * 所有路径都是相对扫描根的路径。
++ */
++class WebDavFileOperations(private val clientFactory: WebDavClientFactory) {
++
++    suspend fun delete(uriString: String): Boolean {
++        val (client, relativePath) = clientFactory.resolve(uriString)
++            ?: throw FileNotFoundException("WebDAV 连接不存在或已删除: $uriString")
++        return client.delete(relativePath)
++    }
++
++    /** 返回新的文件 uri；目标已存在时返回 null（与 SAF 重命名的“名称冲突”语义一致）。 */
++    suspend fun rename(uriString: String, newFileName: String): String? {
++        val (client, relativePath) = clientFactory.resolve(uriString)
++            ?: throw FileNotFoundException("WebDAV 连接不存在或已删除: $uriString")
++        val parent = relativePath.substringBeforeLast('/', missingDelimiterValue = "")
++        val target = if (parent.isEmpty()) newFileName else "$parent/$newFileName"
++        val moved = client.move(relativePath, target, overwrite = false)
++        if (!moved) return null
++        val connectionId = WebDavUri.parseFileUri(uriString)?.connectionId ?: return null
++        return WebDavUri.buildFileUri(connectionId, target)
++    }
++
++    /** 整体替换上传。source 为本地修改后的临时文件。 */
++    suspend fun upload(uriString: String, source: File) {
++        val (client, relativePath) = clientFactory.resolve(uriString)
++            ?: throw FileNotFoundException("WebDAV 连接不存在或已删除: $uriString")
++        client.upload(relativePath, source)
++    }
++
++    suspend fun exists(uriString: String): Boolean {
++        val (client, relativePath) = clientFactory.resolve(uriString) ?: return false
++        return try {
++            client.exists(relativePath)
++        } catch (e: Exception) {
++            if (e is kotlinx.coroutines.CancellationException) throw e
++            Log.w(TAG, "WebDAV HEAD 失败: $uriString", e)
++            false
++        }
++    }
++
++    private companion object {
++        const val TAG = "WebDavFileOperations"
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
+new file mode 100644
+index 0000000..9e65c99
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
+@@ -0,0 +1,165 @@
++package com.lonx.lyrico.data.webdav
++
++import android.util.Log
++import com.lonx.lyrico.data.model.SongFile
++import com.lonx.lyrico.data.model.entity.FolderEntity
++import com.lonx.lyrico.data.model.log.AppLog
++import com.lonx.lyrico.data.model.log.AppLogLevel
++import com.lonx.lyrico.data.model.log.AppLogType
++import java.util.Locale
++import kotlin.math.abs
++
++/** 一次 WebDAV 扫描的结果，字段含义与 SafScanResult 对齐，便于扫描仓库统一处理。 */
++data class WebDavScanResult(
++    val songs: List<WebDavScannedSongFile>,
++    val successfulFolderIds: Set<Long>,
++    val failedFolderIds: Set<Long>,
++    val missingFolderIds: Set<Long>,
++)
++
++data class WebDavScannedSongFile(
++    val songFile: SongFile,
++    val rootFolderId: Long,
++    val folderPath: String,
++)
++
++/**
++ * WebDAV 目录遍历器。
++ *
++ * 与 SAF 扫描器保持同一套语义：返回虚拟 mediaId、绝对展示路径、目录级 folderPath，
++ * 上层扫描仓库无需区分来源即可写入同一张 songs 表。
++ */
++class WebDavScanner(
++    private val configStore: WebDavConfigStore,
++    private val clientFactory: WebDavClientFactory,
++) {
++    suspend fun scanFolders(folders: List<FolderEntity>): WebDavScanResult {
++        val songs = mutableListOf<WebDavScannedSongFile>()
++        val successful = mutableSetOf<Long>()
++        val failed = mutableSetOf<Long>()
++        val missing = mutableSetOf<Long>()
++        val visited = mutableSetOf<String>()
++
++        for (folder in folders) {
++            val treeUri = folder.treeUri
++            val parsed = WebDavUri.parseRootUri(treeUri)
++            if (parsed == null) {
++                failed += folder.id
++                continue
++            }
++            val config = configStore.get(parsed.connectionId)
++            if (config == null) {
++                // 连接已被删除，视为根目录已失效，避免残留歌曲占着列表
++                missing += folder.id
++                continue
++            }
++            val client = clientFactory.byConfig(config)
++
++            try {
++                // 可达性判定：网络/认证失败一律记失败；只有环境明确可达、
++                // 但根目录 404 时才认为目录被移走，避免一次断网清空整个库。
++                try {
++                    client.resolveRootPath()
++                } catch (e: Exception) {
++                    if (e is kotlinx.coroutines.CancellationException) throw e
++                    failed += folder.id
++                    continue
++                }
++                if (!client.rootExists()) {
++                    missing += folder.id
++                    continue
++                }
++
++                walk(
++                    client = client,
++                    config = config,
++                    displayRootPath = folder.path,
++                    rootFolderId = folder.id,
++                    output = songs,
++                    visited = visited,
++                )
++                successful += folder.id
++            } catch (e: Exception) {
++                if (e is kotlinx.coroutines.CancellationException) throw e
++                Log.e(TAG, "扫描 WebDAV 文件夹失败: ${folder.path}", e)
++                AppLog.record(
++                    AppLogType.APP, TAG, "WebDAV scan root failed",
++                    "path=${folder.path}\ntreeUri=$treeUri\n${e::class.java.simpleName}: ${e.message}",
++                    treeUri, AppLogLevel.ERROR, e,
++                )
++                failed += folder.id
++            }
++        }
++
++        return WebDavScanResult(songs, successful, failed, missing)
++    }
++
++    private suspend fun walk(
++        client: WebDavClient,
++        config: WebDavConfig,
++        displayRootPath: String,
++        rootFolderId: Long,
++        output: MutableList<WebDavScannedSongFile>,
++        visited: MutableSet<String>,
++    ) {
++        val stack = ArrayDeque<String>()
++        stack.addLast("")
++
++        while (stack.isNotEmpty()) {
++            val currentRelative = stack.removeLast()
++            val children = client.propfind(currentRelative, depth = 1)
++
++            for (child in children) {
++                if (child.name.isBlank()) continue
++                if (child.isDirectory) {
++                    if (shouldSkipDirectory(child.name)) continue
++                    stack.addLast(child.relativePath)
++                    continue
++                }
++                if (!WebDavClient.isAudioFile(child.name)) continue
++
++                val key = "${config.id}|${child.relativePath}"
++                if (!visited.add(key)) continue
++
++                val absolutePath = buildDisplayPath(displayRootPath, child.relativePath)
++                val displayFolder = absolutePath.substringBeforeLast('/', missingDelimiterValue = displayRootPath)
++                output += WebDavScannedSongFile(
++                    songFile = SongFile(
++                        mediaId = virtualMediaId(key),
++                        uri = WebDavUri.buildFileUri(config.id, child.relativePath).toSafeUri(),
++                        filePath = absolutePath,
++                        fileName = child.name,
++                        lastModified = child.lastModified,
++                        dateAdded = child.lastModified,
++                        duration = 0L,
++                        fileSize = child.size,
++                    ),
++                    rootFolderId = rootFolderId,
++                    folderPath = displayFolder,
++                )
++            }
++        }
++    }
++
++    private fun String.toSafeUri(): android.net.Uri = android.net.Uri.parse(this)
++
++    private fun buildDisplayPath(rootPath: String, relativePath: String): String =
++        "${rootPath.trimEnd('/')}/${relativePath.trimStart('/')}"
++
++    private fun shouldSkipDirectory(name: String): Boolean {
++        val normalized = name.lowercase(Locale.ROOT)
++        return normalized.startsWith(".") ||
++            normalized == "@eadir" ||
++            normalized == "#recycle" ||
++            normalized == "#snapshot"
++    }
++
++    private fun virtualMediaId(key: String): Long {
++        val hash = key.hashCode().toLong()
++        return -abs(hash).coerceAtLeast(1L)
++    }
++
++    private companion object {
++        const val TAG = "WebDavScanner"
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavUri.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavUri.kt
+new file mode 100644
+index 0000000..eaad60b
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavUri.kt
+@@ -0,0 +1,75 @@
++package com.lonx.lyrico.data.webdav
++
++/**
++ * Lyrico 的 WebDAV 虚拟 URI 方案。
++ *
++ * 目录根： lyricowebdav-tree://<connectionId>/?path=/Music
++ * 文件：   lyricowebdav://<connectionId>/<相对扫描根的路径>
++ *
++ * 用自定义 scheme 而不是 http(s)，是为了让整个库的读写链路可以一眼识别出
++ * “这是远程文件”，不会被误当成普通网络链接或 MediaStore 条目处理。
++ */
++object WebDavUri {
++
++    const val FILE_SCHEME = "lyricowebdav"
++    const val TREE_SCHEME = "lyricowebdav-tree"
++
++    private const val QUERY_PATH = "path"
++
++    data class Parsed(val connectionId: String, val relativePath: String)
++
++    /** treeUri：注册到 folders 表的根标识。 */
++    fun buildRootUri(connectionId: String, basePath: String): String {
++        val path = WebDavClient.normalizeRelative(basePath)
++        return "$TREE_SCHEME://$connectionId/" +
++            (if (path.isEmpty()) "" else "?$QUERY_PATH=/" + encodeQuery(path))
++    }
++
++    fun parseRootUri(uriString: String?): Parsed? {
++        if (uriString.isNullOrBlank()) return null
++        val schemePrefix = "$TREE_SCHEME://"
++        if (!uriString.startsWith(schemePrefix)) return null
++        val rest = uriString.removePrefix(schemePrefix)
++        val connectionId = rest.substringBefore('/').substringBefore('?')
++        if (connectionId.isBlank()) return null
++        val query = rest.substringAfter('?', "")
++        val basePath = query
++            .split('&')
++            .firstOrNull { it.startsWith("$QUERY_PATH=") }
++            ?.substringAfter('=')
++            ?.let { decodeQuery(it) }
++            .orEmpty()
++        return Parsed(connectionId, WebDavClient.normalizeRelative(basePath))
++    }
++
++    /** 文件 uri：歌曲记录的 uri 字段。 */
++    fun buildFileUri(connectionId: String, relativePath: String): String {
++        val encoded = WebDavClient.normalizeRelative(relativePath)
++            .split('/')
++            .joinToString("/") { WebDavClient.encodePathSegment(it) }
++        return "$FILE_SCHEME://$connectionId/$encoded"
++    }
++
++    fun parseFileUri(uriString: String): Parsed? {
++        if (!uriString.startsWith("$FILE_SCHEME://")) return null
++        val rest = uriString.removePrefix("$FILE_SCHEME://")
++        val connectionId = rest.substringBefore('/')
++        if (connectionId.isBlank()) return null
++        val path = rest.substringAfter('/', "")
++        return Parsed(connectionId, WebDavClient.normalizeRelative(WebDavClient.decodePath(path)))
++    }
++
++    /** folders.treeUri 表示 WebDAV 根目录时返回对应的连接信息。 */
++    fun treeRoot(uriString: String?): Parsed? = parseRootUri(uriString)
++
++    fun isWebDavUri(uriString: String?): Boolean =
++        uriString != null && (uriString.startsWith("$FILE_SCHEME://") || uriString.startsWith("$TREE_SCHEME://"))
++
++    private fun encodeQuery(value: String): String =
++        value.split('/').filter { it.isNotBlank() }.joinToString("/") {
++            WebDavClient.encodePathSegment(it)
++        }
++
++    private fun decodeQuery(value: String): String =
++        WebDavClient.decodePath(value)
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt b/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
+index a0e2113..fb0aade 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
+@@ -213,7 +213,8 @@ val appModule = module {
+                 LyricoDatabase.MIGRATION_19_20,
+                 LyricoDatabase.MIGRATION_20_21,
+                 LyricoDatabase.MIGRATION_21_22,
+-                LyricoDatabase.MIGRATION_22_23
++                LyricoDatabase.MIGRATION_22_23,
++                LyricoDatabase.MIGRATION_23_24
+             )
+             .addCallback(object : RoomDatabase.Callback() {
+                 override fun onCreate(db: SupportSQLiteDatabase) {
+@@ -231,6 +232,16 @@ val appModule = module {
+     single { get<LyricoDatabase>().libraryIndexDao() }
+     single { get<LyricoDatabase>().sourcePluginDao() }
+     single { get<LyricoDatabase>().songCustomTagKeyDao() }
++    single { get<LyricoDatabase>().scanJournalDao() }
++    single {
++        com.lonx.lyrico.data.webdav.WebDavConfigStore(
++            androidContext().getSharedPreferences("lyrico_webdav", android.content.Context.MODE_PRIVATE)
++        )
++    }
++    single { com.lonx.lyrico.data.webdav.WebDavClientFactory(get()) }
++    single { com.lonx.lyrico.data.webdav.WebDavFileOperations(get()) }
++    single { com.lonx.lyrico.data.webdav.WebDavScanner(get(), get()) }
++    single { com.lonx.lyrico.data.song.file.WebDavFileBridge(get()) }
+     single<SettingsRepository> { SettingsRepositoryImpl(androidContext()) }
+     single { CustomTagKeyRepository(get()) }
+     single { EditFieldConfigRepository(androidContext()) }
+@@ -240,7 +251,7 @@ val appModule = module {
+     single { com.lonx.lyrico.data.LibraryOperationLock() }
+     single { LibraryFolderRepository(get(), get(), androidContext(), get(), get()) }
+     single { CacheManager(androidContext(), get()) }
+-    single { AudioFileAccess(androidContext()) }
++    single { AudioFileAccess(androidContext(), get()) }
+     single { ImageMimeTypeDetector() }
+     single<ImageBytesFetcher> { DefaultImageBytesFetcher(get(), get()) }
+     single { PictureMutationResolver(get(), get()) }
+@@ -248,13 +259,13 @@ val appModule = module {
+     single { AudioTagMutationResolver(get(), get()) }
+     single<AudioTagRepository> { AudioTagRepositoryImpl(androidContext(), get(), get(), get()) }
+     single { com.lonx.lyrico.data.artwork.ArtistPosterReader(androidContext(), get(), get(), get()) }
+-    single<SongFileRepository> { SongFileRepositoryImpl(androidContext(), get(), get()) }
++    single<SongFileRepository> { SongFileRepositoryImpl(androidContext(), get(), get(), get()) }
+     single { SortKeyUpdater() }
+     single { SongMetadataMapper(get()) }
+     single<SongLibraryRepository> { SongLibraryRepositoryImpl(get(), get(), get(), get()) }
+     single<SongSearchRepository> { SongSearchRepositoryImpl(get()) }
+     single<LibraryScanRepository> {
+-        LibraryScanRepositoryImpl(androidContext(), get(), get(), get(), get(), get(), get(), get(), get())
++        LibraryScanRepositoryImpl(androidContext(), get(), get(), get(), get(), get(), get(), get(), get(), get())
+     }
+     single { ReadAudioTagsUseCase(get(), get()) }
+     single { SaveAudioTagsUseCase(get(), get(), get()) }
+@@ -327,6 +338,7 @@ val appModule = module {
+     viewModel { PluginViewModel(get(), get(), get(), get(), get(), get()) }
+ 
+     viewModel { FolderManagerViewModel(get(), get(), get(), get()) }
++    viewModel { com.lonx.lyrico.viewmodel.WebDavSetupViewModel(get(), get()) }
+     viewModel { ArtistPosterFoldersViewModel(get(), get(), get()) }
+     viewModel { com.lonx.lyrico.viewmodel.ArtistPosterEditViewModel(get(), get(), get(), get(), get(), get()) }
+     viewModel { BatchRenameViewModel(get(), get(), get(), get(), get()) }
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/screens/FolderManagerScreen.kt b/lyrico-app/src/main/java/com/lonx/lyrico/screens/FolderManagerScreen.kt
+index b89ee6a..fe57774 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/screens/FolderManagerScreen.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/screens/FolderManagerScreen.kt
+@@ -206,6 +206,7 @@ fun FolderManagerScreen(
+         buildFolderBreadcrumbs(currentFolder, currentNode, folderTree, rootPathLabel)
+     }
+     val showConfirmDialog = remember { mutableStateOf(false) }
++    var showWebDavDialog by remember { mutableStateOf(false) }
+ 
+     val folderPickerLauncher = rememberLauncherForActivityResult(
+         contract = ActivityResultContracts.OpenDocumentTree()
+@@ -291,6 +292,26 @@ fun FolderManagerScreen(
+     val sortPopupState = rememberPopupState()
+ 
+     Box(modifier = Modifier.fillMaxSize()) {
++        if (showWebDavDialog) {
++            WindowDialog(
++                title = stringResource(R.string.webdav_add_folder),
++                show = true,
++                onDismissRequest = { showWebDavDialog = false },
++            ) {
++                WebDavSetupDialog(
++                    onDismiss = { showWebDavDialog = false },
++                    onFolderSelected = { connectionId, basePath, displayPath ->
++                        viewModel.addWebDavFolder(
++                            connectionId = connectionId,
++                            displayPath = displayPath,
++                            rootUri = com.lonx.lyrico.data.webdav.WebDavUri.buildRootUri(connectionId, basePath),
++                        )
++                        showWebDavDialog = false
++                    },
++                )
++            }
++        }
++
+         LibraryDetailPage(
+             title = folderTitle,
+             onBack = navigateUpAction,
+@@ -302,6 +323,11 @@ fun FolderManagerScreen(
+                         label = stringResource(R.string.folder_manager_title),
+                         onClick = { folderPickerLauncher.launch(null) }
+                     )
++                    SaltIconButton(
++                        icon = LucideIcons.CloudDownload,
++                        label = stringResource(R.string.webdav_add_folder),
++                        onClick = { showWebDavDialog = true }
++                    )
+                 }
+                 if (currentFolder != null && pagerState.currentPage == 1 && currentSongs.isNotEmpty()) {
+                     val sortTypes = SortBy.entries.toList()
+@@ -407,6 +433,14 @@ fun FolderManagerScreen(
+                                             contentDescription = null
+                                         )
+                                     }
++                                    IconButton(
++                                        onClick = { showWebDavDialog = true }
++                                    ) {
++                                        Icon(
++                                            imageVector = LucideIcons.CloudDownload,
++                                            contentDescription = stringResource(R.string.webdav_add_folder)
++                                        )
++                                    }
+                                 }
+ 
+                                 if (
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/screens/WebDavSetupDialog.kt b/lyrico-app/src/main/java/com/lonx/lyrico/screens/WebDavSetupDialog.kt
+new file mode 100644
+index 0000000..9acb96f
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/screens/WebDavSetupDialog.kt
+@@ -0,0 +1,152 @@
++package com.lonx.lyrico.screens
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.lonx.lyrico.viewmodel.WebDavSetupViewModel
++import org.koin.androidx.compose.koinViewModel
++import top.yukonga.miuix.kmp.basic.ButtonDefaults
++import top.yukonga.miuix.kmp.basic.Icon
++import top.yukonga.miuix.kmp.basic.IconButton
++import top.yukonga.miuix.kmp.basic.TextButton
++import top.yukonga.miuix.kmp.theme.MiuixTheme
++import com.lonx.lyrico.ui.components.icons.LucideIcons
++
++/**
++ * WebDAV 目录添加向导。
++ *
++ * 三步：填连接 → 测试并浏览 → 选定目录加入库。
++ * 这里的“选定目录”就是文件夹管理里的一个根，后续扫描、改标签都基于它，
++ * 与本地 SAF 文件夹地位相同。
++ */
++@Composable
++fun WebDavSetupDialog(
++    onDismiss: () -> Unit,
++    onFolderSelected: (connectionId: String, basePath: String, displayPath: String) -> Unit,
++) {
++    val viewModel: WebDavSetupViewModel = koinViewModel()
++    val state by viewModel.state.collectAsStateWithLifecycle()
++
++    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
++        if (state.connectionId == null) {
++            OutlinedTextField(
++                value = state.serverUrl,
++                onValueChange = viewModel::updateServerUrl,
++                label = { Text("服务器地址") },
++                placeholder = { Text("https://nas.example.com:5006 或 /dav") },
++                singleLine = true,
++                modifier = Modifier.fillMaxWidth(),
++            )
++            Spacer(Modifier.height(8.dp))
++            OutlinedTextField(
++                value = state.userName,
++                onValueChange = viewModel::updateUserName,
++                label = { Text("用户名") },
++                singleLine = true,
++                modifier = Modifier.fillMaxWidth(),
++            )
++            Spacer(Modifier.height(8.dp))
++            OutlinedTextField(
++                value = state.password,
++                onValueChange = viewModel::updatePassword,
++                label = { Text("密码") },
++                singleLine = true,
++                visualTransformation = PasswordVisualTransformation(),
++                modifier = Modifier.fillMaxWidth(),
++            )
++            Spacer(Modifier.height(12.dp))
++            TextButton(
++                text = if (state.isLoading) "连接中…" else "测试连接",
++                onClick = viewModel::connect,
++                enabled = state.canConnect,
++                modifier = Modifier.fillMaxWidth(),
++                colors = ButtonDefaults.textButtonColorsPrimary(),
++            )
++        } else {
++            // 目录浏览：只列目录，避免把整个音乐库拉一遍
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                TextButton(
++                    text = if (state.browsePath.isEmpty()) "根目录" else ".. ${state.browsePath.substringAfterLast('/')}",
++                    onClick = {
++                        if (state.browsePath.isEmpty()) {
++                            viewModel.connect()
++                        } else {
++                            viewModel.goUp()
++                        }
++                    },
++                )
++                Spacer(Modifier.weight(1f))
++                if (state.isLoading) CircularProgressIndicator(Modifier.width(20.dp))
++            }
++            LazyColumn(Modifier.weight(1f, fill = false).height(260.dp)) {
++                items(state.entries, key = { it.relativePath.ifBlank { it.name } }) { entry ->
++                    Row(
++                        Modifier
++                            .fillMaxWidth()
++                            .clickable { viewModel.openDirectory(entry.relativePath) }
++                            .padding(vertical = 10.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        Icon(
++                            imageVector = LucideIcons.Folder,
++                            contentDescription = null,
++                            tint = MiuixTheme.colorScheme.primary,
++                        )
++                        Spacer(Modifier.width(12.dp))
++                        Text(entry.name, fontSize = 15.sp, maxLines = 1)
++                    }
++                }
++            }
++            Text(
++                text = "当前选择：${state.browsePath.ifBlank { "/" }}",
++                fontSize = 12.sp,
++                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
++                modifier = Modifier.padding(vertical = 6.dp),
++            )
++            TextButton(
++                text = "添加此目录",
++                onClick = {
++                    viewModel.saveConnection()?.let { saved ->
++                        onFolderSelected(saved.connectionId, saved.basePath, saved.displayPath)
++                        onDismiss()
++                    }
++                },
++                modifier = Modifier.fillMaxWidth(),
++                colors = ButtonDefaults.textButtonColorsPrimary(),
++            )
++        }
++
++        state.statusMessage?.let { message ->
++            Spacer(Modifier.height(8.dp))
++            Text(
++                text = message,
++                fontSize = 12.sp,
++                color = if (state.isError) MiuixTheme.colorScheme.error
++                else MiuixTheme.colorScheme.onSurfaceVariantSummary,
++            )
++        }
++
++        Row(Modifier.fillMaxWidth().padding(top = 12.dp), horizontalArrangement = Arrangement.End) {
++            TextButton(text = "取消", onClick = onDismiss)
++        }
++    }
++}
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/utils/LibraryScanManager.kt b/lyrico-app/src/main/java/com/lonx/lyrico/utils/LibraryScanManager.kt
+index 90f8ba5..f3bcb13 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/utils/LibraryScanManager.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/utils/LibraryScanManager.kt
+@@ -37,6 +37,9 @@ interface LibraryScanManager {
+     )
+     fun scanFolders(folderIds: Set<Long>, fullRescan: Boolean = false)
+     fun addFolderAndScan(path: String, treeUri: String)
++
++    /** 注册 WebDAV 目录并立即发起扫描。 */
++    fun addWebDavFolderAndScan(path: String, rootUri: String)
+     suspend fun clearLibrary(): Boolean
+ }
+ 
+@@ -93,6 +96,26 @@ class LibraryScanManagerImpl(
+         }
+     }
+ 
++    override fun addWebDavFolderAndScan(path: String, rootUri: String) {
++        val generation = synchronized(queueLock) { requestGeneration }
++        appScope.launch {
++            try {
++                requestMutex.withLock {
++                    if (generation != synchronized(queueLock) { requestGeneration }) return@withLock
++                    val id = folderRepository.registerWebDav(path, rootUri)
++                    enqueueScan(ScanRequest(fullRescan = false, folderIds = setOf(id)))
++                    AppLog.record(AppLogType.APP, "LibraryFolders", "WebDAV folder registered",
++                        "path=$path\nrootUri=$rootUri\nfolderId=$id\nscanQueued=true", rootUri, AppLogLevel.INFO)
++                }
++            } catch (error: Exception) {
++                if (error is kotlinx.coroutines.CancellationException) throw error
++                AppLog.record(AppLogType.APP, "LibraryFolders", "WebDAV folder registration failed",
++                    "path=$path\nrootUri=$rootUri", rootUri, AppLogLevel.ERROR, error)
++                _state.update { it.copy(error = error.message ?: error::class.java.simpleName) }
++            }
++        }
++    }
++
+     override suspend fun clearLibrary(): Boolean {
+         // Invalidate requests whose app-scope coroutines have not entered the queue yet.
+         synchronized(queueLock) { requestGeneration++ }
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/FolderManagerViewModel.kt b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/FolderManagerViewModel.kt
+index 7fad0d1..bb64e52 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/FolderManagerViewModel.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/FolderManagerViewModel.kt
+@@ -97,6 +97,44 @@ class FolderManagerViewModel(
+         libraryScanManager.addFolderAndScan(path, treeUri)
+     }
+ 
++    /** 添加 WebDAV 目录：先用给定凭据验证路径可读，再注册并扫描。 */
++    fun addWebDavFolder(
++        connectionId: String,
++        displayPath: String,
++        rootUri: String,
++    ) {
++        appScope.launch {
++            operationError.value = null
++            try {
++                libraryScanManager.addWebDavFolderAndScan(displayPath, rootUri)
++                AppLog.record(AppLogType.APP, TAG, "WebDAV folder added",
++                    "connectionId=$connectionId\npath=$displayPath\nrootUri=$rootUri", rootUri, AppLogLevel.INFO)
++            } catch (error: Exception) {
++                if (error is kotlinx.coroutines.CancellationException) throw error
++                AppLog.record(AppLogType.APP, TAG, "WebDAV folder add failed",
++                    "connectionId=$connectionId\npath=$displayPath", rootUri, AppLogLevel.ERROR, error)
++                operationError.value = error.message ?: error::class.java.simpleName
++            }
++        }
++    }
++
++    fun clearError() {
++        operationError.value = null
++    }
++
++    /** 清空当前扫描工作日志，下次扫描从头开始。 */
++    fun forgetScanProgress() {
++        appScope.launch {
++            operationError.value = null
++            try {
++                libraryScanManager.scanAll(fullRescan = true)
++            } catch (error: Exception) {
++                if (error is kotlinx.coroutines.CancellationException) throw error
++                operationError.value = error.message ?: error::class.java.simpleName
++            }
++        }
++    }
++
+     fun deleteFolder(folder: FolderEntity) {
+         appScope.launch {
+             operationError.value = null
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
+new file mode 100644
+index 0000000..466ff65
+--- /dev/null
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
+@@ -0,0 +1,170 @@
++package com.lonx.lyrico.viewmodel
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.lonx.lyrico.data.webdav.WebDavClient
++import com.lonx.lyrico.data.webdav.WebDavClientFactory
++import com.lonx.lyrico.data.webdav.WebDavConfig
++import com.lonx.lyrico.data.webdav.WebDavConfigStore
++import com.lonx.lyrico.data.webdav.WebDavEntry
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++
++data class WebDavSetupUiState(
++    val serverUrl: String = "",
++    val userName: String = "",
++    val password: String = "",
++    /** 正在浏览的目录，相对连接根。 */
++    val browsePath: String = "",
++    val entries: List<WebDavEntry> = emptyList(),
++    val isLoading: Boolean = false,
++    val statusMessage: String? = null,
++    val isError: Boolean = false,
++    /** 已验证通过的连接 id。 */
++    val connectionId: String? = null,
++) {
++    val canConnect: Boolean get() = serverUrl.isNotBlank() && !isLoading
++}
++
++data class SavedWebDavFolder(
++    val connectionId: String,
++    val basePath: String,
++    val displayPath: String,
++)
++
++/**
++ * WebDAV 添加向导：填连接 → 测试并浏览目录 → 选定目录交给库扫描。
++ *
++ * 这里只列目录不列音频文件：真正扫描时才遍历音频，
++ * 避免在配置界面就把整个音乐库的文件全拉一遍。
++ * 连接凭据在确认前只存在内存里，点“添加”才写入本地配置。
++ */
++class WebDavSetupViewModel(
++    private val store: WebDavConfigStore,
++    private val factory: WebDavClientFactory,
++) : ViewModel() {
++
++    private val _state = MutableStateFlow(WebDavSetupUiState())
++    val state: StateFlow<WebDavSetupUiState> = _state.asStateFlow()
++
++    private val entryOrder = compareByDescending<WebDavEntry> { it.isDirectory }
++        .thenBy { it.name.lowercase() }
++
++    fun updateServerUrl(value: String) = _state.update { it.copy(serverUrl = value.trim()) }
++    fun updateUserName(value: String) = _state.update { it.copy(userName = value.trim()) }
++    fun updatePassword(value: String) = _state.update { it.copy(password = value) }
++
++    fun connect() {
++        val current = _state.value
++        if (!current.canConnect) return
++        if (!WebDavClient.isValidUrl(current.serverUrl)) {
++            _state.update { it.copy(statusMessage = "服务器地址格式不正确", isError = true) }
++            return
++        }
++        viewModelScope.launch {
++            _state.update { it.copy(isLoading = true, statusMessage = "正在连接…", isError = false) }
++            try {
++                val config = WebDavConfig(
++                    id = current.connectionId ?: store.newId(),
++                    serverUrl = current.serverUrl,
++                    userName = current.userName,
++                    password = current.password,
++                    basePath = "/",
++                )
++                val client = factory.byConfig(config)
++                client.resolveRootPath()
++                val entries = client.propfind("", depth = 1)
++                _state.update {
++                    it.copy(
++                        isLoading = false,
++                        connectionId = config.id,
++                        browsePath = "",
++                        entries = entries.sortedWith(entryOrder),
++                        statusMessage = "已连接，共 ${entries.count { e -> e.isDirectory }} 个目录",
++                        isError = false,
++                    )
++                }
++            } catch (e: Exception) {
++                _state.update { it.copy(isLoading = false, statusMessage = describe(e), isError = true) }
++            }
++        }
++    }
++
++    fun openDirectory(path: String) {
++        val current = _state.value
++        val connectionId = current.connectionId ?: return
++        viewModelScope.launch {
++            _state.update { it.copy(isLoading = true, statusMessage = null) }
++            try {
++                val client = factory.byConfig(
++                    WebDavConfig(
++                        id = connectionId,
++                        serverUrl = current.serverUrl,
++                        userName = current.userName,
++                        password = current.password,
++                    )
++                )
++                val entries = client.propfind(path, depth = 1)
++                _state.update {
++                    it.copy(
++                        isLoading = false,
++                        browsePath = path,
++                        entries = entries.filter { entry -> entry.isDirectory }.sortedWith(entryOrder),
++                    )
++                }
++            } catch (e: Exception) {
++                _state.update { it.copy(isLoading = false, statusMessage = describe(e), isError = true) }
++            }
++        }
++    }
++
++    fun goUp() {
++        val path = _state.value.browsePath
++        if (path.isEmpty()) return
++        openDirectory(path.substringBeforeLast('/', missingDelimiterValue = ""))
++    }
++
++    /** 保存连接并返回待注册的根目录；凭据缺失时返回 null 并提示。 */
++    fun saveConnection(): SavedWebDavFolder? {
++        val current = _state.value
++        val connectionId = current.connectionId
++        if (connectionId == null) {
++            _state.update { it.copy(statusMessage = "请先测试连接", isError = true) }
++            return null
++        }
++        val config = store.save(
++            WebDavConfig(
++                id = connectionId,
++                serverUrl = current.serverUrl,
++                userName = current.userName,
++                password = current.password,
++                basePath = "/",
++            )
++        )
++        val basePath = current.browsePath
++        return SavedWebDavFolder(
++            connectionId = config.id,
++            basePath = basePath,
++            displayPath = buildDisplayPath(config.serverUrl, basePath),
++        )
++    }
++
++    private fun buildDisplayPath(serverUrl: String, path: String): String {
++        val host = runCatching {
++            java.net.URI(if (serverUrl.contains("://")) serverUrl else "https://$serverUrl").host
++        }.getOrNull() ?: serverUrl
++        val trimmed = path.trim('/')
++        return if (trimmed.isEmpty()) "webdav://$host" else "webdav://$host/$trimmed"
++    }
++
++    private fun describe(e: Exception): String = when (e) {
++        is com.lonx.lyrico.data.webdav.WebDavException -> e.message ?: "连接失败"
++        is java.net.UnknownHostException -> "无法解析服务器地址"
++        is java.net.SocketTimeoutException -> "连接超时，请检查地址与网络"
++        is javax.net.ssl.SSLException -> "TLS 握手失败，请确认端口与证书"
++        else -> e.message ?: e::class.java.simpleName
++    }
++}
+diff --git a/lyrico-app/src/main/res/values-zh-rCN/strings.xml b/lyrico-app/src/main/res/values-zh-rCN/strings.xml
+index 4d3e0c6..cd7dcdd 100644
+--- a/lyrico-app/src/main/res/values-zh-rCN/strings.xml
++++ b/lyrico-app/src/main/res/values-zh-rCN/strings.xml
+@@ -952,4 +952,5 @@
+     <string name="reset_library_summary">清除歌曲记录和扫描目录，保留音频文件</string>
+     <string name="reset_library_confirmation">将清除歌曲记录、扫描目录和音乐库索引，但不删除音频文件。之后需要重新添加音频文件夹，是否继续？</string>
+     <string name="library_resetting">正在重置音乐库…</string>
++    <string name="webdav_add_folder">添加 WebDAV 目录</string>
+ </resources>
+diff --git a/lyrico-app/src/main/res/values-zh-rHK/strings.xml b/lyrico-app/src/main/res/values-zh-rHK/strings.xml
+index c17925a..2de218a 100644
+--- a/lyrico-app/src/main/res/values-zh-rHK/strings.xml
++++ b/lyrico-app/src/main/res/values-zh-rHK/strings.xml
+@@ -961,4 +961,5 @@
+     <string name="reset_library_summary">清除歌曲記錄和掃描目錄，保留音訊檔案</string>
+     <string name="reset_library_confirmation">將清除歌曲記錄、掃描目錄和音樂庫索引，但不刪除音訊檔案。之後需要重新加入音訊資料夾，是否繼續？</string>
+     <string name="library_resetting">正在重設音樂庫…</string>
++    <string name="webdav_add_folder">新增 WebDAV 目錄</string>
+ </resources>
+diff --git a/lyrico-app/src/main/res/values-zh-rTW/strings.xml b/lyrico-app/src/main/res/values-zh-rTW/strings.xml
+index a535fa7..9992a81 100644
+--- a/lyrico-app/src/main/res/values-zh-rTW/strings.xml
++++ b/lyrico-app/src/main/res/values-zh-rTW/strings.xml
+@@ -965,4 +965,5 @@
+     <string name="reset_library_summary">清除歌曲記錄和掃描目錄，保留音訊檔案</string>
+     <string name="reset_library_confirmation">將清除歌曲記錄、掃描目錄和音樂庫索引，但不刪除音訊檔案。之後需要重新加入音訊資料夾，是否繼續？</string>
+     <string name="library_resetting">正在重設音樂庫…</string>
++    <string name="webdav_add_folder">新增 WebDAV 目錄</string>
+ </resources>
+diff --git a/lyrico-app/src/main/res/values/strings.xml b/lyrico-app/src/main/res/values/strings.xml
+index 38f682f..197aef8 100644
+--- a/lyrico-app/src/main/res/values/strings.xml
++++ b/lyrico-app/src/main/res/values/strings.xml
+@@ -947,4 +947,5 @@
+     <string name="reset_library_summary">Clear song records and scan folders; keep audio files</string>
+     <string name="reset_library_confirmation">This clears song records, scan folders and library indexes without deleting audio files. Add audio folders again afterward. Continue?</string>
+     <string name="library_resetting">Resetting music library…</string>
++    <string name="webdav_add_folder">Add WebDAV folder</string>
+ </resources>
+-- 
+2.47.3
+
+
+From b7f21dbde3ba1f7bd3c1a756033dafc9dd0b4d38 Mon Sep 17 00:00:00 2001
+From: Lyrico WebDAV <lyrico@local>
+Date: Sat, 14 Nov 2026 11:48:34 +0800
+Subject: [PATCH 2/3] =?UTF-8?q?fix:=20=E8=A1=A5=E9=BD=90=20LibraryScanRepo?=
+ =?UTF-8?q?sitoryImpl=20=E7=BC=BA=E5=A4=B1=E7=9A=84=20scanJournalDao=20?=
+ =?UTF-8?q?=E5=8F=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+构造函数在新增断点续扫时加了 scanJournalDao（第 11 个参数），
+但 Koin 的 AppModule 里仍按旧的 10 个参数注入，导致编译失败。
+CI 首次构建即在此处报错。
+---
+ lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt b/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
+index fb0aade..62dcf65 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/di/AppModule.kt
+@@ -265,7 +265,7 @@ val appModule = module {
+     single<SongLibraryRepository> { SongLibraryRepositoryImpl(get(), get(), get(), get()) }
+     single<SongSearchRepository> { SongSearchRepositoryImpl(get()) }
+     single<LibraryScanRepository> {
+-        LibraryScanRepositoryImpl(androidContext(), get(), get(), get(), get(), get(), get(), get(), get(), get())
++        LibraryScanRepositoryImpl(androidContext(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get())
+     }
+     single { ReadAudioTagsUseCase(get(), get()) }
+     single { SaveAudioTagsUseCase(get(), get(), get()) }
+-- 
+2.47.3
+
+
+From ad0d041bc1a1d84bbda1da047af578156af9242b Mon Sep 17 00:00:00 2001
+From: Lyrico WebDAV <lyrico@local>
+Date: Sat, 14 Nov 2026 12:31:56 +0800
+Subject: [PATCH 3/3] =?UTF-8?q?fix(webdav):=20=E6=98=BE=E5=BC=8F=E5=A3=B0?=
+ =?UTF-8?q?=E6=98=8E=E7=BD=91=E7=BB=9C=E6=9D=83=E9=99=90=EF=BC=8C=E5=B9=B6?=
+ =?UTF-8?q?=E5=8C=BA=E5=88=86=20DNS/=E8=BF=9E=E6=8E=A5/TLS=20=E5=A4=B1?=
+ =?UTF-8?q?=E8=B4=A5=E5=8E=9F=E5=9B=A0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. AndroidManifest 增加 INTERNET 与 ACCESS_NETWORK_STATE。
+   这两个权限在原项目清单里从未声明，官方包是靠第三方依赖在清单合并时
+   带进来的。缺少 INTERNET 时所有网络请求都会抛 UnknownHostException，
+   表现为无法解析服务器地址，极易误判为域名问题。
+
+2. WebDavClient 增加连接级重试（3 次，递增等待）。
+   DDNS 域名（尤其只有 AAAA 记录的家庭宽带）解析常有空窗，
+   一次失败不代表地址错误，重试通常即可成功。
+
+3. 错误提示不再笼统。解析到地址却连不上时，明确指出
+   '域名解析到 IPv6 地址，但当前网络无法连接'，并提示可能原因；
+   TCP 连接失败、超时、TLS 握手失败分别给出对应说明。
+---
+ lyrico-app/src/main/AndroidManifest.xml       | 12 +++
+ .../lonx/lyrico/data/webdav/WebDavClient.kt   | 90 ++++++++++++++++---
+ .../lyrico/viewmodel/WebDavSetupViewModel.kt  | 12 ++-
+ 3 files changed, 98 insertions(+), 16 deletions(-)
+
+diff --git a/lyrico-app/src/main/AndroidManifest.xml b/lyrico-app/src/main/AndroidManifest.xml
+index 7cfedf9..8a272fc 100644
+--- a/lyrico-app/src/main/AndroidManifest.xml
++++ b/lyrico-app/src/main/AndroidManifest.xml
+@@ -1,6 +1,18 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools">
++    <!--
++        网络权限必须显式声明。
++        官方包里这条权限是靠某个第三方依赖在清单合并时带进来的，
++        本项目的 AndroidManifest.xml 里一直没写。
++        一旦依赖变化或合并规则收紧，权限就会掉，
++        表现为所有网络请求都抛 UnknownHostException（看起来像"域名解析失败"），
++        而实际原因是缺少 INTERNET 权限时 DNS 解析无法建立 socket。
++        这里显式声明，不再依赖依赖库的隐式合并。
++    -->
++    <uses-permission android:name="android.permission.INTERNET" />
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
+index 94a0b98..13a39b0 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavClient.kt
+@@ -2,10 +2,12 @@ package com.lonx.lyrico.data.webdav
+ 
+ import android.util.Log
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+ import okhttp3.Credentials
++import okhttp3.Dns
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+@@ -19,6 +21,13 @@ import java.io.File
+ import java.io.IOException
+ import java.io.InputStream
+ import java.io.UnsupportedEncodingException
++import java.net.ConnectException
++import java.net.Inet4Address
++import java.net.Inet6Address
++import java.net.InetAddress
++import java.net.SocketTimeoutException
++import java.net.UnknownHostException
++import javax.net.ssl.SSLException
+ import java.net.URLEncoder
+ import java.util.concurrent.TimeUnit
+ import javax.xml.parsers.DocumentBuilderFactory
+@@ -60,7 +69,11 @@ class WebDavClient(
+     }
+ 
+     private val client: OkHttpClient = OkHttpClient.Builder()
+-        .connectTimeout(20, TimeUnit.SECONDS)
++        // DDNS 域名（尤其只有 AAAA 记录的家庭宽带）解析偶发 SERVFAIL，
++        // 默认的重试策略不够，这里显式放宽并启用连接失败重试。
++        .dns(Dns.SYSTEM)
++        .retryOnConnectionFailure(true)
++        .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+         .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
+         .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
+         .callTimeout(0, TimeUnit.MILLISECONDS)
+@@ -280,18 +293,66 @@ class WebDavClient(
+         }
+ 
+     private suspend fun <T> executeWithAuthRetry(request: Request, handler: (Response) -> T): T {
+-        // 响应体可能被 handler 消费；每次调用都持有独立 response，消费完由调用方/这里统一关闭。
+-        var response = client.newCall(request).execute()
+-        return try {
+-            // 某些服务端不接受抢先式 Basic 认证（返回 401 + WWW-Authenticate），
+-            // 重试一次即可，携带同样的 Authorization 头。
+-            if (response.code == 401 && authHeader != null) {
+-                response.close()
+-                response = client.newCall(request).execute()
++        var attempt = 0
++        var lastError: IOException? = null
++        while (attempt < CONNECT_ATTEMPTS) {
++            attempt++
++            try {
++                var response = client.newCall(request).execute()
++                return try {
++                    // 某些服务端不接受抢先式 Basic 认证（返回 401 + WWW-Authenticate），
++                    // 重试一次即可，携带同样的 Authorization 头。
++                    if (response.code == 401 && authHeader != null) {
++                        response.close()
++                        response = client.newCall(request).execute()
++                    }
++                    handler(response)
++                } finally {
++                    response.close()
++                }
++            } catch (e: UnknownHostException) {
++                // DDNS 域名第一次解析失败往往只是缓存空窗，短暂等待后重试通常就能拿到记录
++                lastError = e
++                Log.w(TAG, "DNS 解析失败（第 $attempt 次）：${request.url.host}", e)
++                if (attempt < CONNECT_ATTEMPTS) delay(DNS_RETRY_DELAY_MS * attempt)
++            } catch (e: ConnectException) {
++                lastError = e
++                Log.w(TAG, "连接失败（第 $attempt 次）：${request.url}", e)
++                if (attempt < CONNECT_ATTEMPTS) delay(DNS_RETRY_DELAY_MS * attempt)
+             }
+-            handler(response)
+-        } finally {
+-            response.close()
++        }
++        throw WebDavException(explainNetworkError(lastError, request.url.toString()), 0, request.url.toString())
++    }
++
++    /**
++     * 把底层网络异常翻译成用户能看懂的说明。
++     *
++     * 之前所有 UnknownHostException 都提示"无法解析服务器地址"，这在 DDNS 场景下非常误导：
++     * 域名其实解析成功了，只是指向的 IPv6 地址当前不可达。
++     */
++    private fun explainNetworkError(error: IOException?, url: String): String {
++        val host = runCatching { java.net.URI(url).host }.getOrNull() ?: url
++        return when (error) {
++            is UnknownHostException -> {
++                val addresses = runCatching { InetAddress.getAllByName(host) }.getOrNull().orEmpty()
++                if (addresses.isEmpty()) {
++                    "无法解析域名 $host。请检查地址拼写、网络连接，或换用 IP 直接连接。"
++                } else {
++                    val hasV4 = addresses.any { it is Inet4Address }
++                    val hasV6 = addresses.any { it is Inet6Address }
++                    val kinds = buildList {
++                        if (hasV4) add("IPv4")
++                        if (hasV6) add("IPv6")
++                    }.joinToString(" / ")
++                    "域名 $host 解析到 ${kinds} 地址，但当前网络无法连接。\n" +
++                        "常见原因：服务端只提供 IPv6，而手机所在网络没有 IPv6 出口；\n" +
++                        "或路由器未做端口映射。可尝试改用局域网 IP 或内网穿透工具。"
++                }
++            }
++            is ConnectException -> "无法连接到 $host。\n请确认服务已启动、端口正确，以及路由器已完成端口映射。"
++            is SocketTimeoutException -> "连接 $host 超时。\n请检查网络状况，或确认服务端是否限制了访问来源。"
++            is SSLException -> "TLS 握手失败：${error.message}。\n请确认端口是否支持 HTTPS，或改用 http:// 开头。"
++            else -> "网络请求失败：${error?.message ?: "未知原因"}"
+         }
+     }
+ 
+@@ -425,6 +486,11 @@ class WebDavClient(
+ 
+     companion object {
+         private const val TAG = "WebDavClient"
++        /** 连接失败（含 DNS 空窗）时的总尝试次数。 */
++        private const val CONNECT_ATTEMPTS = 3
++        /** 每次重试的递增等待，DDNS 解析通常 1~2 秒内就能恢复。 */
++        private const val DNS_RETRY_DELAY_MS = 800L
++        private const val CONNECT_TIMEOUT_SECONDS = 20L
+         private const val REQUEST_ALL = """<?xml version="1.0" encoding="utf-8"?>
+ <d:propfind xmlns:d="DAV:">
+   <d:prop>
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
+index 466ff65..ef3f3ec 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/viewmodel/WebDavSetupViewModel.kt
+@@ -161,10 +161,14 @@ class WebDavSetupViewModel(
+     }
+ 
+     private fun describe(e: Exception): String = when (e) {
+-        is com.lonx.lyrico.data.webdav.WebDavException -> e.message ?: "连接失败"
+-        is java.net.UnknownHostException -> "无法解析服务器地址"
+-        is java.net.SocketTimeoutException -> "连接超时，请检查地址与网络"
+-        is javax.net.ssl.SSLException -> "TLS 握手失败，请确认端口与证书"
++        // WebDavException 里的 message 已经是区分了 DNS / 连接 / TLS 的完整说明，
++        // 直接展示，避免再被笼统的"无法解析服务器地址"覆盖掉。
++        is com.lonx.lyrico.data.webdav.WebDavException ->
++            if (e.code == 0) e.message ?: "连接失败" else (e.message ?: "请求失败") + "（HTTP ${e.code}）"
++        is java.net.UnknownHostException -> "无法解析域名。请检查地址拼写与网络连接。"
++        is java.net.SocketTimeoutException -> "连接超时，请检查地址与网络。"
++        is java.net.ConnectException -> "无法连接到服务器，请确认服务已启动且端口正确。"
++        is javax.net.ssl.SSLException -> "TLS 握手失败，请确认端口是否支持 HTTPS。"
+         else -> e.message ?: e::class.java.simpleName
+     }
+ }
+-- 
+2.47.3
+
