@@ -1,7 +1,7 @@
 From fc11c5cc1cde7f5b519d7e4846979d3e7662c22b Mon Sep 17 00:00:00 2001
 From: Lyrico WebDAV <lyrico@local>
 Date: Sat, 14 Nov 2026 09:19:05 +0800
-Subject: [PATCH 1/4] =?UTF-8?q?feat:=20=E6=94=AF=E6=8C=81=E5=B0=86=20WebDA?=
+Subject: [PATCH 1/5] =?UTF-8?q?feat:=20=E6=94=AF=E6=8C=81=E5=B0=86=20WebDA?=
  =?UTF-8?q?V=20=E7=9B=AE=E5=BD=95=E4=BD=9C=E4=B8=BA=E9=9F=B3=E4=B9=90?=
  =?UTF-8?q?=E5=BA=93=E6=A0=B9?=
 MIME-Version: 1.0
@@ -2806,7 +2806,7 @@ index 38f682f..197aef8 100644
 From b7f21dbde3ba1f7bd3c1a756033dafc9dd0b4d38 Mon Sep 17 00:00:00 2001
 From: Lyrico WebDAV <lyrico@local>
 Date: Sat, 14 Nov 2026 11:48:34 +0800
-Subject: [PATCH 2/4] =?UTF-8?q?fix:=20=E8=A1=A5=E9=BD=90=20LibraryScanRepo?=
+Subject: [PATCH 2/5] =?UTF-8?q?fix:=20=E8=A1=A5=E9=BD=90=20LibraryScanRepo?=
  =?UTF-8?q?sitoryImpl=20=E7=BC=BA=E5=A4=B1=E7=9A=84=20scanJournalDao=20?=
  =?UTF-8?q?=E5=8F=82=E6=95=B0?=
 MIME-Version: 1.0
@@ -2840,7 +2840,7 @@ index fb0aade..62dcf65 100644
 From ad0d041bc1a1d84bbda1da047af578156af9242b Mon Sep 17 00:00:00 2001
 From: Lyrico WebDAV <lyrico@local>
 Date: Sat, 14 Nov 2026 12:31:56 +0800
-Subject: [PATCH 3/4] =?UTF-8?q?fix(webdav):=20=E6=98=BE=E5=BC=8F=E5=A3=B0?=
+Subject: [PATCH 3/5] =?UTF-8?q?fix(webdav):=20=E6=98=BE=E5=BC=8F=E5=A3=B0?=
  =?UTF-8?q?=E6=98=8E=E7=BD=91=E7=BB=9C=E6=9D=83=E9=99=90=EF=BC=8C=E5=B9=B6?=
  =?UTF-8?q?=E5=8C=BA=E5=88=86=20DNS/=E8=BF=9E=E6=8E=A5/TLS=20=E5=A4=B1?=
  =?UTF-8?q?=E8=B4=A5=E5=8E=9F=E5=9B=A0?=
@@ -3053,7 +3053,7 @@ index 466ff65..ef3f3ec 100644
 From d37d8a772e1a0c030cba608bf401a84062add8d1 Mon Sep 17 00:00:00 2001
 From: Lyrico WebDAV <lyrico@local>
 Date: Sat, 14 Nov 2026 13:07:30 +0800
-Subject: [PATCH 4/4] =?UTF-8?q?fix(webdav):=20=E6=94=B9=E7=94=A8=20XmlPull?=
+Subject: [PATCH 4/5] =?UTF-8?q?fix(webdav):=20=E6=94=B9=E7=94=A8=20XmlPull?=
  =?UTF-8?q?Parser=20=E8=A7=A3=E6=9E=90=20207=20=E5=93=8D=E5=BA=94?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -3385,6 +3385,169 @@ index 0000000..836f42f
 +        assertTrue(client().parseMultiStatusForTest(ByteArray(0)).isEmpty())
 +    }
 +}
+-- 
+2.47.3
+
+
+From d95fd428d6ddb835d40c1a3ec5b2e5d526500fc0 Mon Sep 17 00:00:00 2001
+From: Lyrico WebDAV <lyrico@local>
+Date: Sat, 21 Nov 2026 17:19:24 +0800
+Subject: [PATCH 5/5] =?UTF-8?q?fix(webdav):=20=E5=8F=AA=E6=89=AB=E6=8F=8F?=
+ =?UTF-8?q?=E7=94=A8=E6=88=B7=E9=80=89=E4=B8=AD=E7=9A=84=E5=AD=90=E7=9B=AE?=
+ =?UTF-8?q?=E5=BD=95=EF=BC=8C=E4=B8=8D=E5=86=8D=E6=B0=B8=E8=BF=9C=E6=89=AB?=
+ =?UTF-8?q?=E8=BF=9E=E6=8E=A5=E6=A0=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+两个叠加的 bug 导致'不管选什么路径都扫描 Music 文件夹'：
+
+1. WebDavScanner.walk() 完全忽略了 treeUri 中记录的选中路径，
+   永远从连接根 "" 开始遍历。用户选 Music/专辑A 也会把整个服务器
+   根下的音乐全部扫进来。
+
+2. LibraryFolderRepository.registerWebDav() 沿用了 SAF 的
+   collapseToExistingParent = true，新选的子目录会被折叠进已存在的
+   父目录条目，导致 treeUri 被父目录的覆盖。WebDAV 每个根都是独立
+   挂载点，必须关闭折叠。
+
+顺带修正 walk() 的路径拼接：propfind 返回的 relativePath 是相对
+【被请求目录】的，之前当成相对连接根使用，会让子目录层级错乱、
+同一首歌在不同深度被当成不同文件。现在显式拼回相对根的完整路径。
+
+另外补充选中目录本身的存在性探测：原先只检查连接根，
+子目录被删除后会一直 404 而不清理。
+---
+ .../repository/LibraryFolderRepository.kt     | 10 ++-
+ .../lonx/lyrico/data/webdav/WebDavScanner.kt  | 61 ++++++++++++++++---
+ 2 files changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
+index 55f3e07..c354018 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/repository/LibraryFolderRepository.kt
+@@ -49,7 +49,15 @@ class LibraryFolderRepository(
+     suspend fun registerWebDav(path: String, rootUri: String): Long = operationLock.withLock {
+         withContext(Dispatchers.IO) {
+             database.withTransaction {
+-                val registeredId = folders.upsertAndGetId(path, rootUri, addedBySaf = true)
++                // 必须关闭父目录折叠：WebDAV 的每个根都是独立挂载点，
++                // 若折叠到已存在的父目录，用户新选的子目录会被"吸收"进父目录条目，
++                // 表现为不管选哪条路径，最终都只扫描最早注册的那个目录。
++                val registeredId = folders.upsertAndGetId(
++                    path = path,
++                    treeUri = rootUri,
++                    addedBySaf = true,
++                    collapseToExistingParent = false,
++                )
+                 folders.setIgnored(registeredId, false)
+                 indexes.refreshAndPruneIndexes()
+                 registeredId
+diff --git a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
+index 9e65c99..e1bde88 100644
+--- a/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
++++ b/lyrico-app/src/main/java/com/lonx/lyrico/data/webdav/WebDavScanner.kt
+@@ -69,10 +69,30 @@ class WebDavScanner(
+                     missing += folder.id
+                     continue
+                 }
++                // 用户选中的是子目录，也要确认它本身还在；
++                // 只检查连接根的话，子目录被删除后会一直扫描到 404 而无法清理。
++                val selected = WebDavClient.normalizeRelative(parsed.relativePath)
++                if (selected.isNotEmpty()) {
++                    val present = runCatching {
++                        client.probe(
++                            client.resolveRootPath().let { root ->
++                                if (root.isEmpty()) selected else "$root/$selected"
++                            }
++                        )
++                    }.getOrElse { true } // 探测本身出错时不要误判为目录消失
++                    if (!present) {
++                        missing += folder.id
++                        continue
++                    }
++                }
+ 
+                 walk(
+                     client = client,
+                     config = config,
++                    // treeUri 里记录的才是用户真正选中的子目录。
++                    // 之前这里直接忽略它、从连接根 "" 开始遍历，
++                    // 导致无论选哪个目录都会把服务器根下的全部音乐扫进来。
++                    startRelativePath = parsed.relativePath,
+                     displayRootPath = folder.path,
+                     rootFolderId = folder.id,
+                     output = songs,
+@@ -97,36 +117,61 @@ class WebDavScanner(
+     private suspend fun walk(
+         client: WebDavClient,
+         config: WebDavConfig,
++        startRelativePath: String,
+         displayRootPath: String,
+         rootFolderId: Long,
+         output: MutableList<WebDavScannedSongFile>,
+         visited: MutableSet<String>,
+     ) {
++        val start = WebDavClient.normalizeRelative(startRelativePath)
++
++        // 栈里存的是"相对连接根"的目录路径。
++        // WebDavClient.propfind() 返回的 relativePath 是相对【被请求目录】的，
++        // 这里必须自己拼回完整的相对根路径，否则子目录层级会错乱、
++        // 同一首歌在不同深度会被当成不同文件。
+         val stack = ArrayDeque<String>()
+-        stack.addLast("")
++        stack.addLast(start)
+ 
+         while (stack.isNotEmpty()) {
+-            val currentRelative = stack.removeLast()
+-            val children = client.propfind(currentRelative, depth = 1)
++            val currentDir = stack.removeLast()
++            val children = client.propfind(currentDir, depth = 1)
+ 
+             for (child in children) {
+                 if (child.name.isBlank()) continue
++
++                // propfind 给的是相对 currentDir 的路径
++                val childRelativeToRoot = if (currentDir.isEmpty()) {
++                    child.relativePath
++                } else {
++                    "$currentDir/${child.relativePath}"
++                }
++
+                 if (child.isDirectory) {
+                     if (shouldSkipDirectory(child.name)) continue
+-                    stack.addLast(child.relativePath)
++                    stack.addLast(childRelativeToRoot)
+                     continue
+                 }
+                 if (!WebDavClient.isAudioFile(child.name)) continue
+ 
+-                val key = "${config.id}|${child.relativePath}"
++                val key = "${config.id}|$childRelativeToRoot"
+                 if (!visited.add(key)) continue
+ 
+-                val absolutePath = buildDisplayPath(displayRootPath, child.relativePath)
+-                val displayFolder = absolutePath.substringBeforeLast('/', missingDelimiterValue = displayRootPath)
++                // 展示路径相对用户选中的目录
++                val relativeToStart = if (start.isEmpty()) {
++                    childRelativeToRoot
++                } else {
++                    childRelativeToRoot.removePrefix("$start/")
++                }
++                val absolutePath = buildDisplayPath(displayRootPath, relativeToStart)
++                val displayFolder = absolutePath.substringBeforeLast(
++                    '/',
++                    missingDelimiterValue = displayRootPath,
++                )
++
+                 output += WebDavScannedSongFile(
+                     songFile = SongFile(
+                         mediaId = virtualMediaId(key),
+-                        uri = WebDavUri.buildFileUri(config.id, child.relativePath).toSafeUri(),
++                        uri = WebDavUri.buildFileUri(config.id, childRelativeToRoot).toSafeUri(),
+                         filePath = absolutePath,
+                         fileName = child.name,
+                         lastModified = child.lastModified,
 -- 
 2.47.3
 
